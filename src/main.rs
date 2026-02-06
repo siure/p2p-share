@@ -1,104 +1,79 @@
-mod cli;
-mod code;
-mod connect_string;
-mod qr;
+mod crypto;
+mod progress;
+mod protocol;
+mod receiver;
+mod sender;
+mod ticket;
 
-use anyhow::{bail, Context, Result};
-use cli::{Cli, Cmd};
-use clap::{Parser};
-use code::{generate_code, normalize_code};
-use connect_string::{build_connect_string, parse_connect_string, ConnectMeta};
-use rand::RngCore;
-use std::fs;
 use std::path::PathBuf;
 
-fn gen_salt() -> [u8; 16] {
-    let mut s = [0u8; 16];
-    rand::rng().fill_bytes(&mut s);
-    s
+use clap::{Parser, Subcommand};
+
+/// p2p-share — simple peer-to-peer file transfer.
+///
+/// Uses iroh for automatic NAT traversal (UPnP, hole-punching, relay),
+/// so no manual port opening is required.
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
-fn read_file_meta(path: &PathBuf) -> Result<ConnectMeta> {
-    let md = fs::metadata(path)
-        .with_context(|| format!("Failed to stat '{}'", path.display()))?;
-    if !md.is_file() {
-        bail!("'{}' is not a file", path.display());
-    }
-    let name = path
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
-    let size = md.len();
-    Ok(ConnectMeta { name, size })
+#[derive(Subcommand)]
+enum Command {
+    /// Send a file to another device.
+    Send {
+        /// Path to the file to send.
+        file: PathBuf,
+
+        /// Connect to a waiting receiver instead of waiting for one.
+        /// Use the ticket shown by `p2p-share receive --qr`.
+        #[arg(long)]
+        to: Option<String>,
+    },
+
+    /// Receive a file from another device.
+    Receive {
+        /// Connection ticket (shown by the sender) or ip:port for direct LAN.
+        /// Not required when using --qr.
+        target: Option<String>,
+
+        /// Directory to save the received file in.
+        #[arg(short, long, default_value = ".")]
+        output: PathBuf,
+
+        /// Listen mode: create an endpoint, display a QR code, and wait for
+        /// a sender to connect with `p2p-share send --to <ticket>`.
+        /// Useful when the sender is a phone and typing long tickets is impractical.
+        #[arg(long)]
+        qr: bool,
+    },
 }
 
-fn cmd_send(
-    path: PathBuf,
-    code_opt: Option<String>,
-    qr_flag: bool,
-    strong: bool,
-) -> Result<()> {
-    let meta = read_file_meta(&path)?;
-    let code = match code_opt {
-        Some(c) => normalize_code(&c),
-        None => {
-            let words = if strong { 4 } else { 3 };
-            generate_code(words)
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+
+    let result = match cli.command {
+        Command::Send { file, to: None } => sender::run(&file).await,
+        Command::Send { file, to: Some(ref ticket) } => sender::run_reverse(&file, ticket).await,
+        Command::Receive { target: _, output, qr: true } => receiver::run_listen(&output).await,
+        Command::Receive { target: Some(ref target), output, qr: false } => {
+            receiver::run(target, &output).await
+        }
+        Command::Receive { target: None, output: _, qr: false } => {
+            eprintln!("Error: either provide a <TARGET> ticket/address, or use --qr to listen.");
+            eprintln!();
+            eprintln!("Examples:");
+            eprintln!("  p2p-share receive p2psh:XXXXX        # connect to a sender");
+            eprintln!("  p2p-share receive --qr               # wait for a sender (shows QR)");
+            std::process::exit(1);
         }
     };
 
-    let salt = gen_salt();
-    let conn = build_connect_string(Some(meta), &salt)?;
-
-    println!("Your pairing code:");
-    println!("  {}\n", code);
-
-    println!("Connect string (give this to receiver):");
-    println!("  {}\n", conn);
-
-    if qr_flag {
-        println!("QR (scan with phone camera):");
-        qr::print_qr(&conn)?;
-        println!();
-    }
-
-    println!("Receiver command example:");
-    println!("  p2p-share recv '{}' --code '{}'\n", conn, code);
-
-    Ok(())
-}
-
-fn cmd_recv(connect: String, code_opt: Option<String>) -> Result<()> {
-    let code = match code_opt {
-        Some(c) => normalize_code(&c),
-        None => bail!("--code is required (Phase 1: no networking yet)"),
-    };
-
-    let bundle = parse_connect_string(&connect)?;
-    println!("Pairing code entered: {}", code);
-
-    if let Some(meta) = bundle.meta {
-        println!("Incoming file preview:");
-        println!("  Name: {}", meta.name);
-        println!("  Size: {} bytes", meta.size);
-    } else {
-        println!("No file metadata found in connect string.");
-    }
-
-    println!("\nParsed connect string OK. Networking will be added in Phase 2.");
-    Ok(())
-}
-
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    match cli.cmd {
-        Cmd::Send {
-            path,
-            code,
-            qr,
-            strong,
-        } => cmd_send(path.into(), code, qr, strong),
-        Cmd::Recv { connect, code, .. } => cmd_recv(connect, code),
+    if let Err(e) = result {
+        eprintln!("Error: {:#}", e);
+        std::process::exit(1);
     }
 }

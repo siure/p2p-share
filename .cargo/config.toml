@@ -1,0 +1,9 @@
+[target.aarch64-linux-android]
+# Android NDK r27c — API level 21 is the minimum for 64-bit ARM.
+linker = "/home/akily/Android/Sdk/ndk/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+
+[env]
+# C/C++ compilers for -sys crates (ring, etc.) when targeting Android.
+CC_aarch64-linux-android = "/home/akily/Android/Sdk/ndk/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+CXX_aarch64-linux-android = "/home/akily/Android/Sdk/ndk/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++"
+AR_aarch64-linux-android = "/home/akily/Android/Sdk/ndk/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"

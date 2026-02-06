@@ -1,32 +1,19 @@
 [package]
 name = "p2p-share"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "A simple P2P file sharing tool"
 
 [dependencies]
 anyhow = "1.0.100"
-async-trait = "0.1.89"
-base64 = "0.22.1"
-bincode = "2.0.1"
+blake3 = "1.8.2"
 clap = { version = "4.5", features = ["derive"] }
-futures = "0.3.31"
+data-encoding = "2"
 indicatif = "0.18.0"
-libp2p = { version = "0.56.0", default-features = false, features = [
-  "tcp",
-  "quic",
-  "noise",
-  "yamux",
-  "identify",
-  "autonat",
-  "relay",
-  "dcutr",
-  "request-response",
-  "tokio",
-] }
-qrcodegen = "1.8.0"
-rand = "0.9.2"
+iroh = "0.92.0"
 serde = { version = "1.0.226", features = ["derive"] }
 serde_json = "1.0.145"
-tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "fs"] }
-blake3 = "1.8.2"
-petname = "2.0.2"
+n0-future = "0.1"
+snow = "0.9"
+qr2term = "0.3"
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net"] }
