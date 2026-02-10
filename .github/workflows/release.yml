@@ -1,0 +1,204 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-tag:
+    name: Validate tag and versions
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate semantic tag
+        run: |
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected tag format vMAJOR.MINOR.PATCH, got ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure CLI crate version matches tag
+        run: |
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/cli/Cargo.toml | head -n 1)
+          if [ -z "$cargo_version" ]; then
+            echo "Failed to parse CLI version from crates/cli/Cargo.toml"
+            exit 1
+          fi
+          if [ "$cargo_version" != "${{ steps.version.outputs.version }}" ]; then
+            echo "Tag version ${{ steps.version.outputs.version }} does not match CLI version $cargo_version"
+            exit 1
+          fi
+
+      - name: Warn if Android versionName differs
+        run: |
+          android_version=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' android/app/build.gradle.kts | head -n 1)
+          if [ -z "$android_version" ]; then
+            echo "::warning::Failed to parse Android versionName from android/app/build.gradle.kts"
+            exit 0
+          fi
+          if [ "$android_version" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::warning::Android versionName ($android_version) differs from tag version (${{ steps.version.outputs.version }})"
+          fi
+
+  build-cli:
+    name: Build CLI (${{ matrix.os_name }})
+    needs: validate-tag
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os_name: linux
+            target: x86_64-unknown-linux-gnu
+          - runner: windows-latest
+            os_name: windows
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI
+        run: cargo build -p p2p-share --release --target ${{ matrix.target }}
+
+      - name: Package Linux artifact
+        if: matrix.os_name == 'linux'
+        run: |
+          mkdir -p dist
+          tar -C target/${{ matrix.target }}/release \
+            -czf dist/p2p-share-${{ needs.validate-tag.outputs.version }}-linux-x86_64.tar.gz \
+            p2p-share
+
+      - name: Package Windows artifact
+        if: matrix.os_name == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive `
+            -Path target\${{ matrix.target }}\release\p2p-share.exe `
+            -DestinationPath dist\p2p-share-${{ needs.validate-tag.outputs.version }}-windows-x86_64.zip
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.os_name }}
+          path: dist/*
+
+  build-android-release:
+    name: Build Android signed release APK
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager "ndk;27.0.12077973"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Decode Android keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ] || \
+             [ -z "$ANDROID_KEYSTORE_PASSWORD" ] || \
+             [ -z "$ANDROID_KEY_ALIAS" ] || \
+             [ -z "$ANDROID_KEY_PASSWORD" ]; then
+            echo "Missing one or more Android signing secrets"
+            exit 1
+          fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/release.keystore
+
+      - name: Build Rust JNI libraries
+        run: bash android/scripts/build-rust-android.sh
+
+      - name: Build Android release APK
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/android/release.keystore
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Package Android APK
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk \
+             dist/p2p-share-${{ needs.validate-tag.outputs.version }}-android-release.apk
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist/*
+
+  publish-release:
+    name: Publish GitHub release
+    needs:
+      - build-cli
+      - build-android-release
+      - validate-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*

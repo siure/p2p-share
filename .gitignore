@@ -17,3 +17,4 @@ target/
 /android/.cxx
 /android/local.properties
 /android/send-*
+/android/release.keystore
