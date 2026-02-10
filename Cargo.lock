@@ -2317,8 +2317,29 @@ name = "p2p-share"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "blake3",
  "clap",
+ "p2p-share-core",
+ "tokio",
+]
+
+[[package]]
+name = "p2p-share-android-bindings"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "p2p-share-core",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "p2p-share-core"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "blake3",
  "data-encoding",
  "indicatif",
  "iroh",
