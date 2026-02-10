@@ -1,3 +1,9 @@
+fun propOrEnv(name: String): String? {
+    val fromProp = (project.findProperty(name) as String?)?.takeIf { it.isNotBlank() }
+    val fromEnv = System.getenv(name)?.takeIf { it.isNotBlank() }
+    return fromProp ?: fromEnv
+}
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -5,6 +11,17 @@ plugins {
 }
 
 android {
+    val releaseKeystorePath = propOrEnv("ANDROID_KEYSTORE_PATH")
+    val releaseKeystorePassword = propOrEnv("ANDROID_KEYSTORE_PASSWORD")
+    val releaseKeyAlias = propOrEnv("ANDROID_KEY_ALIAS")
+    val releaseKeyPassword = propOrEnv("ANDROID_KEY_PASSWORD")
+    val hasReleaseSigning = listOf(
+        releaseKeystorePath,
+        releaseKeystorePassword,
+        releaseKeyAlias,
+        releaseKeyPassword
+    ).all { !it.isNullOrBlank() }
+
     namespace = "com.akily.p2pshare"
     compileSdk = 35
     defaultConfig {
@@ -24,6 +41,17 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("ciRelease") {
+                storeFile = file(releaseKeystorePath!!)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -31,6 +59,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("ciRelease")
+            }
         }
     }
 
