@@ -76,4 +76,4 @@ jobs:
 
       - name: Build Android debug APK
         working-directory: android
-        run: ./gradlew --no-daemon assembleDebug
+        run: ./gradlew --no-daemon -Dorg.gradle.java.home="${JAVA_HOME}" assembleDebug
