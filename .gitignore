@@ -1,12 +1,18 @@
 /target
+target/
 /build
 /.gradle
+.gradle/
 .idea/
 *.iml
+/app/build
+/.kotlin
 
 /android/.gradle
 /android/build
 /android/app/build
+/android/.kotlin
+
 /android/.cxx
 /android/local.properties
-/android/send-*.jpg
+/android/send-*
