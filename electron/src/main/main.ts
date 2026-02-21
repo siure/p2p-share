@@ -1,12 +1,13 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu } from "electron";
-import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessByStdio } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import type { Readable } from "node:stream";
 import QRCode from "qrcode";
 
-import type { StartTransferPayload, TransferEvent, TransferMode } from "../shared/ipc";
+import type { BuildInfo, StartTransferPayload, TransferEvent, TransferMode } from "../shared/ipc";
+import { evaluateSchemaCompatibility, TRANSFER_EVENT_SCHEMA_VERSION } from "../shared/schema";
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -15,6 +16,12 @@ interface ActiveTransfer {
   mode: TransferMode;
   canceled: boolean;
   forceKillTimer: NodeJS.Timeout | null;
+}
+
+interface ResolvedCliCommand {
+  command: string;
+  argsPrefix: string[];
+  source: string;
 }
 
 let activeTransfer: ActiveTransfer | null = null;
@@ -87,7 +94,7 @@ function existingFile(filePath: string): boolean {
   return Boolean(filePath && fs.existsSync(filePath));
 }
 
-function resolveCliCommand(): { command: string; argsPrefix: string[]; source: string } {
+function resolveCliCommand(): ResolvedCliCommand {
   const binary = cliBinaryName();
   const root = repoRoot();
   const envPath = trimOrEmpty(process.env.P2P_SHARE_CLI_PATH);
@@ -117,6 +124,184 @@ function resolveCliCommand(): { command: string; argsPrefix: string[]; source: s
     command: process.platform === "win32" ? "cargo.exe" : "cargo",
     argsPrefix: ["run", "-q", "-p", "p2p-share", "--"],
     source: "cargo-run"
+  };
+}
+
+function commandExists(command: string): boolean {
+  const value = trimOrEmpty(command);
+  if (!value) {
+    return false;
+  }
+
+  if (path.isAbsolute(value) || value.includes(path.sep)) {
+    return existingFile(value);
+  }
+
+  const pathEnv = trimOrEmpty(process.env.PATH);
+  if (!pathEnv) {
+    return false;
+  }
+
+  const entries = pathEnv.split(path.delimiter).map((entry) => entry.trim()).filter(Boolean);
+  const hasExtension = /\.[a-z0-9]+$/i.test(value);
+  const windowsExts = trimOrEmpty(process.env.PATHEXT)
+    .split(";")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const extCandidates =
+    process.platform === "win32"
+      ? hasExtension
+        ? [""]
+        : windowsExts.length > 0
+          ? windowsExts
+          : [".EXE", ".CMD", ".BAT", ".COM"]
+      : [""];
+
+  for (const entry of entries) {
+    for (const ext of extCandidates) {
+      const candidate = path.join(entry, `${value}${ext}`);
+      if (existingFile(candidate)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function firstNonEmptyLine(text: string): string {
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  return "";
+}
+
+function extractSemver(text: string): string | null {
+  const match = /\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b/.exec(text);
+  return match?.[0] ?? null;
+}
+
+function maybeParseJsonObject(line: string): Record<string, unknown> | null {
+  const text = line.trim();
+  if (!text || !text.startsWith("{") || !text.endsWith("}")) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function objectStringField(obj: Record<string, unknown>, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const value = obj[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+
+function probeCliVersion(cli: ResolvedCliCommand): {
+  version: string | null;
+  schemaVersion: string | null;
+  error: string | null;
+} {
+  const argsCandidates = [
+    [...cli.argsPrefix, "version", "--json"],
+    [...cli.argsPrefix, "--version", "--json"],
+    [...cli.argsPrefix, "--version"]
+  ];
+
+  let lastError = "";
+
+  for (const args of argsCandidates) {
+    const result = spawnSync(cli.command, args, {
+      cwd: repoRoot(),
+      encoding: "utf8",
+      timeout: 8000
+    });
+
+    if (result.error) {
+      lastError = result.error.message;
+      continue;
+    }
+
+    const stdout = typeof result.stdout === "string" ? result.stdout : "";
+    const stderr = typeof result.stderr === "string" ? result.stderr : "";
+    const firstLine = firstNonEmptyLine(stdout) || firstNonEmptyLine(stderr);
+    const parsedJson = maybeParseJsonObject(firstLine);
+
+    const versionFromJson = parsedJson
+      ? objectStringField(parsedJson, "version", "cli_version", "app_version")
+      : null;
+    const schemaFromJson = parsedJson
+      ? objectStringField(
+          parsedJson,
+          "schema_version",
+          "event_schema_version",
+          "transfer_event_schema_version"
+        )
+      : null;
+
+    const version = versionFromJson ?? extractSemver(firstLine);
+    if (version || schemaFromJson) {
+      return {
+        version: version ?? null,
+        schemaVersion: schemaFromJson ?? null,
+        error: null
+      };
+    }
+
+    if (result.status === 0) {
+      return {
+        version: null,
+        schemaVersion: null,
+        error: "CLI version command succeeded but no parseable version payload was returned."
+      };
+    }
+
+    lastError = firstLine || `Version command exited with code ${result.status ?? 1}.`;
+  }
+
+  return {
+    version: null,
+    schemaVersion: null,
+    error: lastError || "Failed to query CLI version."
+  };
+}
+
+function getBuildInfo(): BuildInfo {
+  const cli = resolveCliCommand();
+  const exists = commandExists(cli.command);
+  const versionProbe = exists
+    ? probeCliVersion(cli)
+    : {
+        version: null,
+        schemaVersion: null,
+        error: `CLI command not found: ${cli.command}`
+      };
+  const compatibility = evaluateSchemaCompatibility(
+    TRANSFER_EVENT_SCHEMA_VERSION,
+    versionProbe.schemaVersion
+  );
+
+  return {
+    appVersion: app.getVersion(),
+    expectedSchemaVersion: TRANSFER_EVENT_SCHEMA_VERSION,
+    cli: {
+      command: cli.command,
+      source: cli.source,
+      exists,
+      version: versionProbe.version,
+      schemaVersion: versionProbe.schemaVersion,
+      compatibility,
+      error: versionProbe.error
+    }
   };
 }
 
@@ -169,7 +354,12 @@ function cleanupTransfer(): void {
 }
 
 function emitStatus(message: string, value: string): void {
-  emitTransferEvent({ kind: "status", message, value });
+  emitTransferEvent({
+    kind: "status",
+    message,
+    value,
+    schema_version: TRANSFER_EVENT_SCHEMA_VERSION
+  });
 }
 
 function startTransfer(payload: StartTransferPayload): void {
@@ -179,6 +369,11 @@ function startTransfer(payload: StartTransferPayload): void {
 
   const transferArgs = buildTransferArgs(payload);
   const cli = resolveCliCommand();
+  if (!commandExists(cli.command)) {
+    throw new Error(
+      `Transfer engine command not found: ${cli.command}. Build the CLI or set P2P_SHARE_CLI_PATH.`
+    );
+  }
   const args = [...cli.argsPrefix, "--json", ...transferArgs];
   const child = spawn(cli.command, args, {
     cwd: repoRoot(),
@@ -236,7 +431,8 @@ function startTransfer(payload: StartTransferPayload): void {
       emitTransferEvent({
         kind: "error",
         message: text.replace(/^Error:\s*/, ""),
-        value: "stderr_error"
+        value: "stderr_error",
+        schema_version: TRANSFER_EVENT_SCHEMA_VERSION
       });
     }
   });
@@ -245,7 +441,8 @@ function startTransfer(payload: StartTransferPayload): void {
     emitTransferEvent({
       kind: "error",
       message: `Failed to start transfer process: ${err.message}`,
-      value: "spawn_error"
+      value: "spawn_error",
+      schema_version: TRANSFER_EVENT_SCHEMA_VERSION
     });
     cleanupTransfer();
   });
@@ -260,7 +457,8 @@ function startTransfer(payload: StartTransferPayload): void {
       emitTransferEvent({
         kind: "error",
         message: `Transfer process exited with code ${code}${signal ? ` (signal ${signal})` : ""}.`,
-        value: "process_exit"
+        value: "process_exit",
+        schema_version: TRANSFER_EVENT_SCHEMA_VERSION
       });
     } else {
       emitStatus("Transfer process finished.", "process_exit");
@@ -269,7 +467,8 @@ function startTransfer(payload: StartTransferPayload): void {
     emitTransferEvent({
       kind: "process_end",
       message: signal ? `signal ${signal}` : `code ${code ?? 0}`,
-      value: wasCanceled ? "canceled" : "completed"
+      value: wasCanceled ? "canceled" : "completed",
+      schema_version: TRANSFER_EVENT_SCHEMA_VERSION
     });
   });
 }
@@ -338,6 +537,8 @@ ipcMain.handle("app:get-platform-info", () => ({
   arch: process.arch,
   cwd: repoRoot()
 }));
+
+ipcMain.handle("app:get-build-info", () => getBuildInfo());
 
 ipcMain.handle("app:get-default-output-dir", () => {
   try {

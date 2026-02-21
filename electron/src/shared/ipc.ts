@@ -1,3 +1,5 @@
+import type { SchemaCompatibility } from "./schema";
+
 export type TransferMode = "send_wait" | "send_to_ticket" | "receive_target" | "receive_listen";
 
 export interface StartTransferPayload {
@@ -12,6 +14,7 @@ export interface TransferEventBase {
   kind: string;
   message?: string;
   value?: string;
+  schema_version?: string;
 }
 
 export interface TransferEventStatus extends TransferEventBase {
@@ -80,8 +83,25 @@ export interface PlatformInfo {
   cwd: string;
 }
 
+export interface CliBuildInfo {
+  command: string;
+  source: string;
+  exists: boolean;
+  version: string | null;
+  schemaVersion: string | null;
+  compatibility: SchemaCompatibility;
+  error: string | null;
+}
+
+export interface BuildInfo {
+  appVersion: string;
+  expectedSchemaVersion: string;
+  cli: CliBuildInfo;
+}
+
 export interface P2PShareApi {
   getPlatformInfo: () => Promise<PlatformInfo>;
+  getBuildInfo: () => Promise<BuildInfo>;
   getDefaultOutputDir: () => Promise<string>;
   pickFile: () => Promise<string | null>;
   pickDir: (defaultPath?: string) => Promise<string | null>;

@@ -4,6 +4,7 @@ import type { P2PShareApi, StartTransferPayload, TransferEvent } from "../shared
 
 const api: P2PShareApi = {
   getPlatformInfo: () => ipcRenderer.invoke("app:get-platform-info"),
+  getBuildInfo: () => ipcRenderer.invoke("app:get-build-info"),
   getDefaultOutputDir: () => ipcRenderer.invoke("app:get-default-output-dir"),
   pickFile: () => ipcRenderer.invoke("dialog:pick-file"),
   pickDir: (defaultPath?: string) => ipcRenderer.invoke("dialog:pick-dir", defaultPath),

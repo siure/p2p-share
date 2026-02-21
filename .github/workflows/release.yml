@@ -182,11 +182,82 @@ jobs:
           name: android-apk
           path: dist/*
 
+  build-desktop:
+    name: Build desktop (${{ matrix.os_name }})
+    needs: validate-tag
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os_name: linux
+            dist_script: dist:linux
+            artifact_name: desktop-linux
+            artifact_paths: |
+              electron/dist/*.AppImage
+              electron/dist/*.tar.gz
+          - runner: windows-latest
+            os_name: windows
+            dist_script: dist:win
+            artifact_name: desktop-windows
+            artifact_paths: |
+              electron/dist/*.exe
+              electron/dist/*.zip
+          - runner: macos-latest
+            os_name: macos
+            dist_script: dist:mac
+            artifact_name: desktop-macos
+            artifact_paths: |
+              electron/dist/*.dmg
+              electron/dist/*.zip
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: electron/package-lock.json
+
+      - name: Install desktop dependencies
+        working-directory: electron
+        run: npm ci
+
+      - name: Build CLI binary
+        run: cargo build -p p2p-share --release
+
+      - name: Package desktop app
+        working-directory: electron
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run ${{ matrix.dist_script }}
+
+      - name: Verify packaged CLI binary
+        working-directory: electron
+        run: npm run test:packaged-binary
+
+      - name: Upload desktop artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_paths }}
+          if-no-files-found: error
+
   publish-release:
     name: Publish GitHub release
     needs:
       - build-cli
       - build-android-release
+      - build-desktop
       - validate-tag
     runs-on: ubuntu-latest
     permissions:
@@ -197,6 +268,11 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
 
       - name: Create release and upload assets
         uses: softprops/action-gh-release@v2

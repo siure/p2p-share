@@ -44,6 +44,14 @@ npm run test:packaged-binary
 
 This checks that packaged artifacts include `resources/bin/<os>/<arch>/p2p-share(\\.exe)`.
 
+## Event Schema Contract
+
+The desktop app consumes CLI JSON events. Schema details and compatibility rules are documented in:
+
+- `docs/event-schema.md`
+
+At runtime, the Electron renderer queries `app:get-build-info` and warns if CLI schema compatibility is unknown or mismatched.
+
 ## Notes
 
 - Build the Rust CLI first for best performance:
@@ -57,3 +65,15 @@ npm run build:cli
 ```bash
 P2P_SHARE_CLI_PATH=/absolute/path/to/p2p-share
 ```
+
+## Releases
+
+Desktop artifacts are produced by `electron-builder`:
+
+- Linux: AppImage (`npm run dist:linux`)
+- Windows: NSIS installer (`npm run dist:win`)
+- macOS: DMG (`npm run dist:mac`)
+
+Repository release automation lives in the root workflow:
+
+- `../.github/workflows/release.yml`

@@ -1,4 +1,5 @@
-import type { P2PShareApi, StartTransferPayload, TransferEvent } from "../shared/ipc";
+import type { BuildInfo, P2PShareApi, StartTransferPayload, TransferEvent } from "../shared/ipc";
+import { evaluateSchemaCompatibility, TRANSFER_EVENT_SCHEMA_VERSION } from "../shared/schema";
 
 const api: P2PShareApi | undefined = window.p2pShareApi;
 
@@ -64,9 +65,46 @@ let filePath = "";
 let isRunning = false;
 let currentTicket = "";
 let logOpen = false;
+let transferSchemaWarningShown = false;
+let platformLabel = "Unknown platform";
+let buildInfoLabel = "";
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function describeCliCompatibility(info: BuildInfo): string {
+  const version = info.cli.version ?? "unknown";
+  const schema = info.cli.schemaVersion ?? "unknown";
+  const source = info.cli.source;
+  return `CLI ${version} (${source}), schema ${schema}`;
+}
+
+function refreshPlatformInfo(): void {
+  platformInfo.textContent = buildInfoLabel ? `${platformLabel} · ${buildInfoLabel}` : platformLabel;
+}
+
+function applyBuildInfoStatus(info: BuildInfo): void {
+  buildInfoLabel = describeCliCompatibility(info);
+  refreshPlatformInfo();
+
+  if (!info.cli.exists) {
+    pushLog(`CLI not found: ${info.cli.command}`);
+    return;
+  }
+
+  if (info.cli.compatibility === "mismatch") {
+    pushLog(
+      `Schema mismatch: expected ${info.expectedSchemaVersion}, CLI reports ${info.cli.schemaVersion ?? "unknown"}.`
+    );
+    return;
+  }
+
+  if (info.cli.compatibility === "unknown") {
+    pushLog(
+      `Schema compatibility is unknown. Expected ${info.expectedSchemaVersion}; CLI did not report a schema version.`
+    );
+  }
 }
 
 function isTransferMode(value: string): value is TransferMode {
@@ -302,6 +340,19 @@ function summarizeEvent(evt: TransferEvent): string {
 function handleTransferEvent(evt: TransferEvent): void {
   if (!evt || typeof evt !== "object") return;
 
+  if (!transferSchemaWarningShown) {
+    const compatibility = evaluateSchemaCompatibility(
+      TRANSFER_EVENT_SCHEMA_VERSION,
+      typeof evt.schema_version === "string" ? evt.schema_version : null
+    );
+    if (compatibility === "mismatch") {
+      transferSchemaWarningShown = true;
+      pushLog(
+        `Transfer event schema mismatch: expected ${TRANSFER_EVENT_SCHEMA_VERSION}, got ${evt.schema_version}.`
+      );
+    }
+  }
+
   pushLog(summarizeEvent(evt));
 
   switch (evt.kind) {
@@ -532,10 +583,12 @@ function init(): void {
   desktopApi
     .getPlatformInfo()
     .then((info) => {
-      platformInfo.textContent = `${info.platform} / ${info.arch}`;
+      platformLabel = `${info.platform} / ${info.arch}`;
+      refreshPlatformInfo();
     })
     .catch(() => {
-      platformInfo.textContent = "Unknown platform";
+      platformLabel = "Unknown platform";
+      refreshPlatformInfo();
     });
 
   desktopApi
@@ -545,6 +598,18 @@ function init(): void {
     })
     .catch(() => {
       outputDir.value = ".";
+    });
+
+  desktopApi
+    .getBuildInfo()
+    .then((info) => {
+      applyBuildInfoStatus(info);
+      if (info.cli.error) {
+        pushLog(`CLI probe warning: ${info.cli.error}`);
+      }
+    })
+    .catch((err) => {
+      pushLog(`Build info unavailable: ${errorMessage(err)}`);
     });
 
   setMode("send");
