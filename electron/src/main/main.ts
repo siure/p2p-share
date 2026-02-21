@@ -10,6 +10,7 @@ import type { BuildInfo, StartTransferPayload, TransferEvent, TransferMode } fro
 import { evaluateSchemaCompatibility, TRANSFER_EVENT_SCHEMA_VERSION } from "../shared/schema";
 
 let mainWindow: BrowserWindow | null = null;
+let cachedRepoRoot: string | null = null;
 
 interface ActiveTransfer {
   child: ChildProcessByStdio<null, Readable, Readable>;
@@ -30,8 +31,68 @@ function cliBinaryName(): string {
   return process.platform === "win32" ? "p2p-share.exe" : "p2p-share";
 }
 
+function existingDirectory(dirPath: string): boolean {
+  if (!dirPath) {
+    return false;
+  }
+  try {
+    return fs.statSync(dirPath).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function looksLikeRepoRoot(candidate: string): boolean {
+  return (
+    existingDirectory(candidate) &&
+    existingFile(path.join(candidate, "Cargo.toml")) &&
+    existingDirectory(path.join(candidate, "crates")) &&
+    existingDirectory(path.join(candidate, "electron"))
+  );
+}
+
+function findRepoRootFrom(startDir: string): string | null {
+  let current = path.resolve(startDir);
+  for (let i = 0; i < 12; i += 1) {
+    if (looksLikeRepoRoot(current)) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  return null;
+}
+
 function repoRoot(): string {
-  return path.resolve(__dirname, "..", "..");
+  if (cachedRepoRoot) {
+    return cachedRepoRoot;
+  }
+
+  const envRoot = trimOrEmpty(process.env.P2P_SHARE_REPO_ROOT);
+  if (looksLikeRepoRoot(envRoot)) {
+    cachedRepoRoot = envRoot;
+    return envRoot;
+  }
+
+  const fromDir = findRepoRootFrom(__dirname);
+  if (fromDir) {
+    cachedRepoRoot = fromDir;
+    return fromDir;
+  }
+
+  const fromCwd = findRepoRootFrom(process.cwd());
+  if (fromCwd) {
+    cachedRepoRoot = fromCwd;
+    return fromCwd;
+  }
+
+  // Last-resort fallback for packaged apps and unknown layouts.
+  const fallback = existingDirectory(process.cwd()) ? process.cwd() : path.resolve(__dirname);
+  cachedRepoRoot = fallback;
+  return fallback;
 }
 
 function packagedOsName(): string {
@@ -449,6 +510,7 @@ function startTransfer(payload: StartTransferPayload): void {
 
   child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
     const wasCanceled = Boolean(activeTransfer?.canceled);
+    const didFail = !wasCanceled && (code !== 0 || signal !== null || sawStructuredError);
     cleanupTransfer();
 
     if (wasCanceled) {
@@ -467,7 +529,7 @@ function startTransfer(payload: StartTransferPayload): void {
     emitTransferEvent({
       kind: "process_end",
       message: signal ? `signal ${signal}` : `code ${code ?? 0}`,
-      value: wasCanceled ? "canceled" : "completed",
+      value: wasCanceled ? "canceled" : didFail ? "failed" : "completed",
       schema_version: TRANSFER_EVENT_SCHEMA_VERSION
     });
   });
