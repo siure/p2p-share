@@ -36,10 +36,10 @@ jobs:
         include:
           - runner: ubuntu-latest
             os_name: linux
+            dist_script: dist:linux
           - runner: windows-latest
             os_name: windows
-          - runner: macos-latest
-            os_name: macos
+            dist_script: dist:win
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -79,7 +79,7 @@ jobs:
 
       - name: Build Electron desktop bundle
         working-directory: electron
-        run: npm run dist
+        run: npm run ${{ matrix.dist_script }}
 
       - name: Verify packaged CLI binary
         working-directory: electron

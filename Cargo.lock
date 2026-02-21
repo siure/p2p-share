@@ -2314,11 +2314,13 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "p2p-share"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
  "p2p-share-core",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

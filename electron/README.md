@@ -32,7 +32,6 @@ Platform-specific packages:
 
 ```bash
 npm run dist:linux
-npm run dist:mac
 npm run dist:win
 ```
 
@@ -72,7 +71,6 @@ Desktop artifacts are produced by `electron-builder`:
 
 - Linux: AppImage (`npm run dist:linux`)
 - Windows: NSIS installer (`npm run dist:win`)
-- macOS: DMG (`npm run dist:mac`)
 
 Repository release automation lives in the root workflow:
 
