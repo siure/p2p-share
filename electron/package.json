@@ -1,0 +1,71 @@
+{
+  "name": "p2p-share-electron",
+  "version": "0.1.0",
+  "private": true,
+  "author": "p2p-share contributors",
+  "description": "Electron desktop GUI for p2p-share",
+  "main": "out/main/index.js",
+  "scripts": {
+    "start": "electron-vite preview",
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build:cli": "cargo build --release -p p2p-share",
+    "test:packaged-binary": "node ./scripts/test-packaged-binary.js",
+    "dist": "npm run build && electron-builder --dir",
+    "dist:linux": "npm run build && electron-builder --linux",
+    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:win": "npm run build && electron-builder --win"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.13",
+    "@types/qrcode": "^1.5.6",
+    "electron": "^34.3.0",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^3.1.0",
+    "typescript": "^5.9.3",
+    "vite": "^5.4.21"
+  },
+  "build": {
+    "appId": "com.akily.p2pshare.desktop",
+    "productName": "P2P Share",
+    "files": [
+      "out/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../target/release",
+        "to": "bin/${os}/${arch}",
+        "filter": [
+          "p2p-share",
+          "p2p-share.exe"
+        ]
+      }
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "tar.gz"
+      ],
+      "category": "Utility"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ]
+    }
+  }
+}
