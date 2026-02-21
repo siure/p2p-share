@@ -1,6 +1,6 @@
 [package]
 name = "p2p-share"
-version = "0.2.2"
+version = "0.3.0"
 edition.workspace = true
 description = "A simple P2P file sharing tool"
 
@@ -8,4 +8,6 @@ description = "A simple P2P file sharing tool"
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 p2p-share-core = { path = "../core" }
