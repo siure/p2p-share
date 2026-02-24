@@ -67,11 +67,14 @@ This repository includes GitHub Actions workflows:
 
 When you push a tag `vX.Y.Z`, the release workflow publishes:
 
-- `p2p-share-X.Y.Z-linux-x86_64.tar.gz`
-- `p2p-share-X.Y.Z-windows-x86_64.zip`
-- Linux desktop artifacts (`.AppImage`, `.tar.gz`)
-- Windows desktop artifacts (`.exe`, `.zip`)
-- `p2p-share-X.Y.Z-android-release.apk` (when Android signing secrets are configured)
+- `p2p-share-cli-vX.Y.Z-linux-x86_64.tar.gz`
+- `p2p-share-cli-vX.Y.Z-windows-x86_64.zip`
+- `p2p-share-gui-vX.Y.Z-linux-x86_64.AppImage`
+- `p2p-share-gui-vX.Y.Z-linux-x86_64.tar.gz`
+- `p2p-share-gui-vX.Y.Z-windows-x86_64.exe`
+- `p2p-share-gui-vX.Y.Z-windows-x86_64.zip`
+- `p2p-share-android-vX.Y.Z.apk` (when Android signing secrets are configured)
+- `p2p-share-checksums-vX.Y.Z.txt`
 
 ### Required GitHub secrets for Android signing
 

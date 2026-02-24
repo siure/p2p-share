@@ -102,7 +102,7 @@ jobs:
         run: |
           mkdir -p dist
           tar -C target/${{ matrix.target }}/release \
-            -czf dist/p2p-share-${{ needs.validate-tag.outputs.version }}-linux-x86_64.tar.gz \
+            -czf dist/p2p-share-cli-v${{ needs.validate-tag.outputs.version }}-linux-x86_64.tar.gz \
             p2p-share
 
       - name: Package Windows artifact
@@ -112,7 +112,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive `
             -Path target\${{ matrix.target }}\release\p2p-share.exe `
-            -DestinationPath dist\p2p-share-${{ needs.validate-tag.outputs.version }}-windows-x86_64.zip
+            -DestinationPath dist\p2p-share-cli-v${{ needs.validate-tag.outputs.version }}-windows-x86_64.zip
 
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
@@ -198,7 +198,7 @@ jobs:
         run: |
           mkdir -p dist
           cp android/app/build/outputs/apk/release/app-release.apk \
-             dist/p2p-share-${{ needs.validate-tag.outputs.version }}-android-release.apk
+             dist/p2p-share-android-v${{ needs.validate-tag.outputs.version }}.apk
 
       - name: Upload Android artifact
         if: steps.android_signing.outputs.enabled == 'true'
@@ -219,16 +219,10 @@ jobs:
             os_name: linux
             dist_script: dist:linux
             artifact_name: desktop-linux
-            artifact_paths: |
-              electron/dist/*.AppImage
-              electron/dist/*.tar.gz
           - runner: windows-latest
             os_name: windows
             dist_script: dist:win
             artifact_name: desktop-windows
-            artifact_paths: |
-              electron/dist/*.exe
-              electron/dist/*.zip
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -263,11 +257,37 @@ jobs:
         working-directory: electron
         run: npm run test:packaged-binary
 
+      - name: Normalize Linux GUI artifact names
+        if: matrix.os_name == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          version="${{ needs.validate-tag.outputs.version }}"
+          appimage="$(ls electron/dist/*.AppImage | head -n 1)"
+          tarball="$(ls electron/dist/*.tar.gz | head -n 1)"
+          cp "$appimage" "dist/p2p-share-gui-v${version}-linux-x86_64.AppImage"
+          cp "$tarball" "dist/p2p-share-gui-v${version}-linux-x86_64.tar.gz"
+
+      - name: Normalize Windows GUI artifact names
+        if: matrix.os_name == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $version = "${{ needs.validate-tag.outputs.version }}"
+          $exe = Get-ChildItem -Path electron/dist -Filter *.exe | Select-Object -First 1
+          if (-not $exe) { throw "No .exe artifact found in electron/dist" }
+          Copy-Item $exe.FullName "dist/p2p-share-gui-v$version-windows-x86_64.exe"
+
+          $zip = Get-ChildItem -Path electron/dist -Filter *.zip | Select-Object -First 1
+          if (-not $zip) { throw "No .zip artifact found in electron/dist" }
+          Copy-Item $zip.FullName "dist/p2p-share-gui-v$version-windows-x86_64.zip"
+
       - name: Upload desktop artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_paths }}
+          path: dist/*
           if-no-files-found: error
 
   publish-release:
@@ -290,7 +310,7 @@ jobs:
       - name: Generate SHA256 checksums
         run: |
           cd dist
-          sha256sum * > SHA256SUMS.txt
+          sha256sum * > p2p-share-checksums-v${{ needs.validate-tag.outputs.version }}.txt
 
       - name: Create release and upload assets
         uses: softprops/action-gh-release@v2
