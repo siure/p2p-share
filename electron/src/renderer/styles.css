@@ -151,7 +151,11 @@ body {
 }
 
 .brand-icon {
+  display: block;
   flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
 }
 
 .brand-name {
