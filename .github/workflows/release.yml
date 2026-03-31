@@ -265,6 +265,10 @@ jobs:
           name: cli-bin-${{ matrix.os_name }}
           path: target/release
 
+      - name: Restore Linux CLI executable bit
+        if: matrix.os_name == 'linux'
+        run: chmod +x target/release/p2p-share
+
       - name: Package desktop app
         working-directory: electron
         env:
