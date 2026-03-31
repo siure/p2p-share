@@ -28,8 +28,8 @@ android {
         applicationId = "com.akily.p2pshare"
         minSdk = 29
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.3.2"
+        versionCode = 3
+        versionName = "0.3.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

@@ -33,15 +33,15 @@ jobs:
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Ensure CLI crate version matches tag
+      - name: Ensure workspace version matches tag
         run: |
-          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/cli/Cargo.toml | head -n 1)
+          cargo_version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml | head -n 1)
           if [ -z "$cargo_version" ]; then
-            echo "Failed to parse CLI version from crates/cli/Cargo.toml"
+            echo "Failed to parse workspace version from Cargo.toml"
             exit 1
           fi
           if [ "$cargo_version" != "${{ steps.version.outputs.version }}" ]; then
-            echo "Tag version ${{ steps.version.outputs.version }} does not match CLI version $cargo_version"
+            echo "Tag version ${{ steps.version.outputs.version }} does not match workspace version $cargo_version"
             exit 1
           fi
 

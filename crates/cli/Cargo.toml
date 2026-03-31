@@ -1,6 +1,6 @@
 [package]
 name = "p2p-share"
-version = "0.3.2"
+version.workspace = true
 edition.workspace = true
 description = "A simple P2P file sharing tool"
 
