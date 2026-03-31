@@ -45,14 +45,16 @@
       }
     ],
     "directories": {
-      "output": "dist"
+      "output": "dist",
+      "buildResources": "build"
     },
     "linux": {
       "target": [
         "AppImage",
         "tar.gz"
       ],
-      "category": "Utility"
+      "category": "Utility",
+      "icon": "build/icons"
     },
     "win": {
       "target": [
