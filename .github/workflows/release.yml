@@ -97,6 +97,13 @@ jobs:
       - name: Build CLI
         run: cargo build -p p2p-share --release --target ${{ matrix.target }}
 
+      - name: Upload raw CLI binary for desktop packaging
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-bin-${{ matrix.os_name }}
+          path: ${{ matrix.os_name == 'windows' && format('target/{0}/release/p2p-share.exe', matrix.target) || format('target/{0}/release/p2p-share', matrix.target) }}
+          if-no-files-found: error
+
       - name: Package Linux artifact
         if: matrix.os_name == 'linux'
         run: |
@@ -128,32 +135,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-          cache: gradle
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android NDK
-        run: |
-          sdkmanager "ndk;27.0.12077973"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
-
       - name: Check Android signing secrets
         id: android_signing
         env:
@@ -171,6 +152,38 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "::warning::Android signing secrets are missing. Skipping Android release artifact."
           fi
+
+      - name: Set up Java
+        if: steps.android_signing.outputs.enabled == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Set up Android SDK
+        if: steps.android_signing.outputs.enabled == 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        if: steps.android_signing.outputs.enabled == 'true'
+        run: |
+          sdkmanager "ndk;27.0.12077973"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        if: steps.android_signing.outputs.enabled == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Cache Rust
+        if: steps.android_signing.outputs.enabled == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk
+        if: steps.android_signing.outputs.enabled == 'true'
+        run: cargo install cargo-ndk --locked
 
       - name: Decode Android keystore
         if: steps.android_signing.outputs.enabled == 'true'
@@ -209,7 +222,9 @@ jobs:
 
   build-desktop:
     name: Build desktop (${{ matrix.os_name }})
-    needs: validate-tag
+    needs:
+      - validate-tag
+      - build-cli
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -244,8 +259,11 @@ jobs:
         working-directory: electron
         run: npm ci
 
-      - name: Build CLI binary
-        run: cargo build -p p2p-share --release
+      - name: Download prebuilt CLI binary
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-bin-${{ matrix.os_name }}
+          path: target/release
 
       - name: Package desktop app
         working-directory: electron
@@ -301,9 +319,24 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download artifacts
+      - name: Download packaged CLI artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: cli-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download Android artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+          path: dist
+          if-no-files-found: ignore
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
           path: dist
           merge-multiple: true
 
