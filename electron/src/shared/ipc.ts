@@ -4,7 +4,7 @@ export type TransferMode = "send_wait" | "send_to_ticket" | "receive_target" | "
 
 export interface StartTransferPayload {
   mode: TransferMode;
-  filePath?: string;
+  filePaths?: string[];
   ticket?: string;
   target?: string;
   outputDir?: string;
@@ -50,6 +50,8 @@ export interface TransferEventCompleted extends TransferEventBase {
   size_bytes?: number;
   saved_path?: string;
   saved_to?: string;
+  content_kind?: "file" | "bundle";
+  item_count?: number;
 }
 
 export interface TransferEventError extends TransferEventBase {
@@ -103,7 +105,7 @@ export interface P2PShareApi {
   getPlatformInfo: () => Promise<PlatformInfo>;
   getBuildInfo: () => Promise<BuildInfo>;
   getDefaultOutputDir: () => Promise<string>;
-  pickFile: () => Promise<string | null>;
+  pickFiles: () => Promise<string[] | null>;
   pickDir: (defaultPath?: string) => Promise<string | null>;
   startTransfer: (payload: StartTransferPayload) => Promise<{ ok: boolean }>;
   cancelTransfer: () => Promise<{ ok: boolean }>;

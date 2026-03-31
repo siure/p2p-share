@@ -4,7 +4,7 @@
 
 ## Versioning
 
-- Current schema version: `1.0.0`
+- Current schema version: `1.1.0`
 - Compatibility rule: same major version is compatible.
 - During the transition period, producers may omit `schema_version`; consumers should treat that as `unknown` compatibility.
 
@@ -45,6 +45,8 @@ All events are JSON objects with:
 - `size_bytes`: resulting file size.
 - `saved_path`: saved destination path (preferred).
 - `saved_to`: legacy destination path key (compatibility field).
+- `content_kind`: `file` | `bundle` (optional).
+- `item_count`: number of logical files transferred (optional).
 
 8. `error`
 - `message`: human-readable error.

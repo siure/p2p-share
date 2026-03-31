@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::events::TransferContentKind;
+
 /// Size of each plaintext chunk before encryption: 60 KiB.
 /// Kept under 65535 bytes (Noise max message) to leave room for the 16-byte
 /// AEAD tag that Noise appends.
@@ -14,6 +16,15 @@ pub struct FileHeader {
     pub size: u64,
     /// Hex-encoded blake3 hash of the file contents.
     pub blake3: String,
+    /// Kind of transferred content. Absent means a regular file for compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_kind: Option<TransferContentKind>,
+    /// Number of logical files in the transfer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_count: Option<u64>,
+    /// Display name for extracted bundle contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_name: Option<String>,
 }
 
 /// Single-line JSON terminated by `\n`, so the receiver can read it with
@@ -51,6 +62,7 @@ pub fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{human_bytes, FileHeader};
+    use crate::events::TransferContentKind;
 
     #[test]
     fn header_round_trip() {
@@ -58,6 +70,9 @@ mod tests {
             name: "demo.txt".to_string(),
             size: 42,
             blake3: "abc123".to_string(),
+            content_kind: Some(TransferContentKind::File),
+            item_count: Some(1),
+            logical_name: None,
         };
         let wire = header.to_wire().expect("serialize");
         let wire_str = String::from_utf8(wire).expect("utf8");
@@ -65,6 +80,8 @@ mod tests {
         assert_eq!(parsed.name, "demo.txt");
         assert_eq!(parsed.size, 42);
         assert_eq!(parsed.blake3, "abc123");
+        assert_eq!(parsed.content_kind, Some(TransferContentKind::File));
+        assert_eq!(parsed.item_count, Some(1));
     }
 
     #[test]

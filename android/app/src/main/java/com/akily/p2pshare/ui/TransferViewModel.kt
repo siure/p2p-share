@@ -9,6 +9,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.akily.p2pshare.bridge.BridgeEvent
 import com.akily.p2pshare.bridge.TransferEngine
 import com.akily.p2pshare.bridge.TransferEngineFactory
 import com.akily.p2pshare.model.ReceiveFormState
@@ -74,8 +75,8 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
         receiveForm = receiveForm.copy(targetInput = target)
     }
 
-    fun setFileUri(uri: Uri?) {
-        sendForm = sendForm.copy(fileUri = uri)
+    fun setFileUris(uris: List<Uri>) {
+        sendForm = sendForm.copy(fileUris = uris, preparedPaths = emptyList())
     }
 
     fun setOutputTree(uri: Uri?) {
@@ -83,33 +84,44 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
         prefs.saveOutputTree(uri)
     }
 
-    fun prepareSendFile(uri: Uri?) {
-        if (uri == null) {
-            sendForm = sendForm.copy(preparedPath = null)
+    fun prepareSendFiles(uris: List<Uri>) {
+        if (uris.isEmpty()) {
+            sendForm = sendForm.copy(fileUris = emptyList(), preparedPaths = emptyList())
+            sendUi = sendUi.copy(stage = TransferStage.IDLE, statusLine = readyStatus, errorMessage = null)
             return
         }
-        sendForm = sendForm.copy(fileUri = uri, preparedPath = null)
-        sendUi = sendUi.copy(stage = TransferStage.PREPARING, statusLine = "Preparing file...")
+
+        sendForm = sendForm.copy(fileUris = uris, preparedPaths = emptyList())
+        val preparingLabel = if (uris.size == 1) "Preparing file..." else "Preparing files..."
+        sendUi = sendUi.copy(stage = TransferStage.PREPARING, statusLine = preparingLabel)
 
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
-                    FilePrep.copyUriToCacheFile(getApplication(), uri)
+                    FilePrep.copyUrisToCacheFiles(getApplication(), uris)
                 }
-            }.onSuccess { file ->
-                if (sendForm.fileUri != uri) return@onSuccess
-                sendForm = sendForm.copy(fileUri = uri, preparedPath = file.absolutePath)
+            }.onSuccess { files ->
+                if (sendForm.fileUris != uris) return@onSuccess
+                sendForm = sendForm.copy(
+                    fileUris = uris,
+                    preparedPaths = files.map(File::getAbsolutePath),
+                )
+                val preparedLabel = if (files.size == 1) {
+                    "File prepared: ${files.first().name}"
+                } else {
+                    "${files.size} files prepared"
+                }
                 sendUi = sendUi.copy(
                     stage = TransferStage.IDLE,
-                    statusLine = "File prepared: ${file.name}",
+                    statusLine = preparedLabel,
                     errorMessage = null,
                 )
             }.onFailure { err ->
-                if (sendForm.fileUri != uri) return@onFailure
-                sendForm = sendForm.copy(preparedPath = null)
+                if (sendForm.fileUris != uris) return@onFailure
+                sendForm = sendForm.copy(preparedPaths = emptyList())
                 sendUi = sendUi.copy(
                     stage = TransferStage.FAILED,
-                    statusLine = "Failed to prepare selected file.",
+                    statusLine = "Failed to prepare selected files.",
                     errorMessage = err.message,
                 )
             }
@@ -117,22 +129,26 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun startSend() {
-        val path = sendForm.preparedPath
-        if (path.isNullOrBlank()) {
+        val paths = sendForm.preparedPaths
+        if (paths.isEmpty()) {
             sendUi = sendUi.copy(
                 stage = TransferStage.FAILED,
-                statusLine = "Select a file first.",
+                statusLine = "Select files first.",
             )
             return
         }
-        val prepared = File(path)
-        if (!prepared.exists() || !prepared.isFile || prepared.length() == 0L) {
+
+        val invalidPath = paths.firstOrNull { path ->
+            val prepared = File(path)
+            !prepared.exists() || !prepared.isFile || prepared.length() == 0L
+        }
+        if (invalidPath != null) {
             sendUi = sendUi.copy(
                 stage = TransferStage.FAILED,
-                statusLine = "Selected file is unavailable.",
-                errorMessage = "Prepared file is missing or empty. Pick the file again.",
+                statusLine = "Selected files are unavailable.",
+                errorMessage = "One or more prepared files are missing or empty. Pick the files again.",
             )
-            sendForm = sendForm.copy(preparedPath = null)
+            sendForm = sendForm.copy(preparedPaths = emptyList())
             return
         }
 
@@ -141,9 +157,9 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
         sendUi = sendUi.copy(stage = TransferStage.PREPARING, statusLine = "Starting send...")
 
         if (sendForm.sendToTicketMode) {
-            engine.startSendToTicket(path, sendForm.ticketInput.trim())
+            engine.startSendToTicket(paths, sendForm.ticketInput.trim())
         } else {
-            engine.startSendWait(path)
+            engine.startSendWait(paths)
         }
 
         startPolling()
@@ -171,12 +187,12 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
         stopPolling()
         updateActiveUi {
             it.copy(
-            stage = TransferStage.IDLE,
-            statusLine = "Canceled",
-            ticket = null,
-            qrPayload = null,
-            progressDone = 0,
-            progressTotal = 0,
+                stage = TransferStage.IDLE,
+                statusLine = "Canceled",
+                ticket = null,
+                qrPayload = null,
+                progressDone = 0,
+                progressTotal = 0,
             )
         }
     }
@@ -240,7 +256,7 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
         pollJob = null
     }
 
-    private suspend fun applyEvent(event: com.akily.p2pshare.bridge.BridgeEvent): Boolean {
+    private suspend fun applyEvent(event: BridgeEvent): Boolean {
         val current = currentUi()
         when (event.kind) {
             "status" -> {
@@ -305,6 +321,8 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
                         completedName = event.fileName,
                         completedSize = event.sizeBytes,
                         completedPath = finalPath,
+                        completedContentKind = event.contentKind,
+                        completedItemCount = event.itemCount ?: 1,
                         errorMessage = null,
                     )
                 )
@@ -330,14 +348,14 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun copyToOutputTree(sourcePath: String, fileName: String, tree: Uri): String? {
         val uri = runCatching {
-            FilePrep.copyReceivedFileToTree(getApplication(), sourcePath, tree, fileName)
+            FilePrep.copyReceivedEntryToTree(getApplication(), sourcePath, tree, fileName)
         }.getOrNull()
         return uri?.toString() ?: sourcePath
     }
 
     private fun appendHistory(success: Boolean, detail: String) {
         val ui = currentUi()
-        val path = ui.completedPath ?: sendForm.preparedPath ?: receiveForm.outputTreeUri?.toString()
+        val path = ui.completedPath ?: sendForm.preparedPaths.firstOrNull() ?: receiveForm.outputTreeUri?.toString()
         val inferredName = path
             ?.replace('\\', '/')
             ?.substringAfterLast('/')
@@ -399,17 +417,26 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
         return doc?.name ?: uri.toString()
     }
 
-    fun describeFileUri(uri: Uri?): String {
-        if (uri == null) return ""
+    fun describeFileUris(uris: List<Uri>): String {
+        if (uris.isEmpty()) return ""
+        val names = uris.map(::displayNameForUri)
+        if (names.size == 1) {
+            return names.first()
+        }
+        val preview = names.take(3).joinToString(", ")
+        val suffix = if (names.size > 3) ", +${names.size - 3} more" else ""
+        return "${names.size} files: $preview$suffix"
+    }
+
+    private fun displayNameForUri(uri: Uri): String {
         val doc = DocumentFile.fromSingleUri(getApplication(), uri)
         val name = doc?.name?.trim().orEmpty()
         if (name.isNotEmpty()) return name
 
-        val fallback = uri.lastPathSegment
+        return uri.lastPathSegment
             ?.substringAfterLast('/')
             ?.substringAfterLast(':')
             ?.trim()
             .orEmpty()
-        return fallback
     }
 }

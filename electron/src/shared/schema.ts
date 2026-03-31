@@ -1,4 +1,4 @@
-export const TRANSFER_EVENT_SCHEMA_VERSION = "1.0.0";
+export const TRANSFER_EVENT_SCHEMA_VERSION = "1.1.0";
 
 export type SchemaCompatibility = "compatible" | "mismatch" | "unknown";
 

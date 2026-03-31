@@ -11,10 +11,10 @@ object RustBindings {
     external fun nativeCreateController(): Long
 
     @JvmStatic
-    external fun nativeStartSendWait(handle: Long, filePath: String)
+    external fun nativeStartSendWait(handle: Long, filePathsJson: String)
 
     @JvmStatic
-    external fun nativeStartSendToTicket(handle: Long, filePath: String, ticket: String)
+    external fun nativeStartSendToTicket(handle: Long, filePathsJson: String, ticket: String)
 
     @JvmStatic
     external fun nativeStartReceiveTarget(handle: Long, target: String, outputDir: String)

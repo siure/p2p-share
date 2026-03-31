@@ -116,6 +116,13 @@ function trimOrEmpty(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map(trimOrEmpty).filter(Boolean);
+}
+
 function isTransferMode(value: string): value is TransferMode {
   return (
     value === "send_wait" ||
@@ -137,7 +144,7 @@ function parseTransferPayload(payload: unknown): StartTransferPayload {
 
   return {
     mode,
-    filePath: trimOrEmpty(payload.filePath),
+    filePaths: stringArray(payload.filePaths),
     ticket: trimOrEmpty(payload.ticket),
     target: trimOrEmpty(payload.target),
     outputDir: trimOrEmpty(payload.outputDir)
@@ -368,22 +375,22 @@ function getBuildInfo(): BuildInfo {
 
 function buildTransferArgs(payload: StartTransferPayload): string[] {
   const mode = payload.mode;
-  const filePath = trimOrEmpty(payload.filePath);
+  const filePaths = stringArray(payload.filePaths);
   const ticket = trimOrEmpty(payload.ticket);
   const target = trimOrEmpty(payload.target);
   const outputDir = trimOrEmpty(payload.outputDir);
 
   switch (mode) {
     case "send_wait":
-      if (!filePath) {
-        throw new Error("File path is required.");
+      if (filePaths.length === 0) {
+        throw new Error("At least one file path is required.");
       }
-      return ["send", filePath];
+      return ["send", ...filePaths];
     case "send_to_ticket":
-      if (!filePath || !ticket) {
-        throw new Error("File path and ticket are required.");
+      if (filePaths.length === 0 || !ticket) {
+        throw new Error("At least one file path and a ticket are required.");
       }
-      return ["send", filePath, "--to", ticket];
+      return ["send", ...filePaths, "--to", ticket];
     case "receive_target":
       if (!target || !outputDir) {
         throw new Error("Target and output directory are required.");
@@ -630,18 +637,18 @@ ipcMain.handle("qr:create-data-url", async (_event, text: unknown) => {
   });
 });
 
-ipcMain.handle("dialog:pick-file", async () => {
+ipcMain.handle("dialog:pick-files", async () => {
   if (!mainWindow) {
     return null;
   }
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: "Select File to Send",
-    properties: ["openFile"]
+    title: "Select Files to Send",
+    properties: ["openFile", "multiSelections"]
   });
   if (result.canceled || result.filePaths.length === 0) {
     return null;
   }
-  return result.filePaths[0] ?? null;
+  return result.filePaths;
 });
 
 ipcMain.handle("dialog:pick-dir", async (_event, defaultPath: unknown) => {

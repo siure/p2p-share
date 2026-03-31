@@ -4,10 +4,12 @@ use std::{io, io::Write};
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use p2p_share_core::events::{ConnectionPathKind, TransferEvent, TransferEventSink};
+use p2p_share_core::events::{
+    ConnectionPathKind, TransferContentKind, TransferEvent, TransferEventSink,
+};
 use serde::Serialize;
 
-const TRANSFER_EVENT_SCHEMA_VERSION: &str = "1.0.0";
+const TRANSFER_EVENT_SCHEMA_VERSION: &str = "1.1.0";
 
 /// p2p-share — simple peer-to-peer file transfer.
 ///
@@ -25,12 +27,13 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Command {
-    /// Send a file to another device.
+    /// Send one or more files to another device.
     Send {
-        /// Path to the file to send.
-        file: PathBuf,
+        /// One or more file paths to send.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
 
         /// Connect to a waiting receiver instead of waiting for one.
         /// Use the ticket shown by `p2p-share receive --qr`.
@@ -71,6 +74,8 @@ struct TransferEventRecord {
     size_bytes: Option<u64>,
     saved_path: Option<String>,
     latency_ms: Option<f64>,
+    content_kind: Option<TransferContentKind>,
+    item_count: Option<u64>,
 }
 
 impl TransferEventRecord {
@@ -86,6 +91,8 @@ impl TransferEventRecord {
             size_bytes: None,
             saved_path: None,
             latency_ms: None,
+            content_kind: None,
+            item_count: None,
         }
     }
 
@@ -168,6 +175,8 @@ fn map_event(event: TransferEvent) -> TransferEventRecord {
             file_name: Some(result.file_name),
             size_bytes: Some(result.size_bytes),
             saved_path: result.saved_path.map(|p| p.display().to_string()),
+            content_kind: Some(result.content_kind),
+            item_count: Some(result.item_count),
             ..TransferEventRecord::base("completed")
         },
         TransferEvent::Error { code, message } => TransferEventRecord::error(code, message),
@@ -198,11 +207,11 @@ async fn run_human(command: Command) -> Result<()> {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Command::Send { file, to: None } => p2p_share_core::sender::run(&file).await,
+        Command::Send { files, to: None } => p2p_share_core::sender::run_paths(&files).await,
         Command::Send {
-            file,
+            files,
             to: Some(ticket),
-        } => p2p_share_core::sender::run_reverse(&file, &ticket).await,
+        } => p2p_share_core::sender::run_reverse_paths(&files, &ticket).await,
         Command::Receive {
             target: _,
             output,
@@ -231,13 +240,16 @@ async fn run_json(command: Command) -> Result<()> {
 
     let result = match command {
         Command::Version => unreachable!("handled above"),
-        Command::Send { file, to: None } => {
-            p2p_share_core::sender::run_with_sink(&file, Some(sink.clone())).await
+        Command::Send { files, to: None } => {
+            p2p_share_core::sender::run_paths_with_sink(&files, Some(sink.clone())).await
         }
         Command::Send {
-            file,
+            files,
             to: Some(ticket),
-        } => p2p_share_core::sender::run_reverse_with_sink(&file, &ticket, Some(sink.clone())).await,
+        } => {
+            p2p_share_core::sender::run_reverse_paths_with_sink(&files, &ticket, Some(sink.clone()))
+                .await
+        }
         Command::Receive {
             target: _,
             output,
@@ -283,13 +295,19 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_event, missing_target_error, TRANSFER_EVENT_SCHEMA_VERSION};
-    use p2p_share_core::events::{ConnectionPathKind, TransferCompleted, TransferEvent};
+    use super::{map_event, missing_target_error, Cli, Command, TRANSFER_EVENT_SCHEMA_VERSION};
+    use clap::Parser;
+    use p2p_share_core::events::{
+        ConnectionPathKind, TransferCompleted, TransferContentKind, TransferEvent,
+    };
     use std::path::PathBuf;
 
     #[test]
     fn map_event_progress_keeps_counts() {
-        let record = map_event(TransferEvent::Progress { done: 16, total: 64 });
+        let record = map_event(TransferEvent::Progress {
+            done: 16,
+            total: 64,
+        });
         assert_eq!(record.kind, "progress");
         assert_eq!(record.schema_version, TRANSFER_EVENT_SCHEMA_VERSION);
         assert_eq!(record.done, Some(16));
@@ -321,11 +339,15 @@ mod tests {
             file_name: "demo.txt".to_string(),
             size_bytes: 42,
             saved_path: Some(PathBuf::from("/tmp/demo.txt")),
+            content_kind: TransferContentKind::Bundle,
+            item_count: 3,
         }));
         assert_eq!(record.kind, "completed");
         assert_eq!(record.file_name.as_deref(), Some("demo.txt"));
         assert_eq!(record.size_bytes, Some(42));
         assert_eq!(record.saved_path.as_deref(), Some("/tmp/demo.txt"));
+        assert_eq!(record.content_kind, Some(TransferContentKind::Bundle));
+        assert_eq!(record.item_count, Some(3));
     }
 
     #[test]
@@ -334,5 +356,17 @@ mod tests {
         assert!(msg.contains("either provide a <TARGET> ticket/address"));
         assert!(msg.contains("p2p-share receive p2psh:XXXXX"));
         assert!(msg.contains("p2p-share receive --qr"));
+    }
+
+    #[test]
+    fn send_command_accepts_multiple_files() {
+        let cli = Cli::try_parse_from(["p2p-share", "send", "a.txt", "b.txt"]).expect("parse");
+        match cli.command {
+            Command::Send { files, to } => {
+                assert_eq!(files, vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
+                assert!(to.is_none());
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
     }
 }

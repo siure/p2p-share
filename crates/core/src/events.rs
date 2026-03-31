@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone)]
 pub enum TransferMode {
     SendWait,
@@ -16,11 +18,20 @@ pub enum ConnectionPathKind {
     None,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferContentKind {
+    File,
+    Bundle,
+}
+
 #[derive(Debug, Clone)]
 pub struct TransferCompleted {
     pub file_name: String,
     pub size_bytes: u64,
     pub saved_path: Option<PathBuf>,
+    pub content_kind: TransferContentKind,
+    pub item_count: u64,
 }
 
 #[derive(Debug, Clone)]

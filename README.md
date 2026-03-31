@@ -14,6 +14,7 @@ Encrypted peer-to-peer file transfer with a shared Rust core and two frontends.
 
 ```bash
 cargo run -p p2p-share -- send ./file.txt
+cargo run -p p2p-share -- send ./file.txt ./photo.jpg ./notes.pdf
 cargo run -p p2p-share -- receive p2psh:... --output .
 ```
 
@@ -36,8 +37,8 @@ Desktop GUI notes:
 
 - The GUI runs the existing Rust CLI under the hood using structured JSON events (`--json`).
 - It supports all transfer modes:
-  - send and wait (`send <FILE>`)
-  - send to receiver ticket (`send <FILE> --to <TICKET>`)
+  - send and wait (`send <FILE>...`)
+  - send to receiver ticket (`send <FILE>... --to <TICKET>`)
   - receive from target (`receive <TARGET> --output <DIR>`)
   - receive listen/QR mode (`receive --qr --output <DIR>`)
 - For best performance, build the CLI first:

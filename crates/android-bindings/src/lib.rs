@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use p2p_share_core::events::{ConnectionPathKind, TransferEvent, TransferEventSink};
+use p2p_share_core::events::{
+    ConnectionPathKind, TransferContentKind, TransferEvent, TransferEventSink,
+};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinHandle;
@@ -22,6 +24,8 @@ pub struct TransferEventRecord {
     pub size_bytes: Option<u64>,
     pub saved_path: Option<String>,
     pub latency_ms: Option<f64>,
+    pub content_kind: Option<String>,
+    pub item_count: Option<u64>,
 }
 
 impl TransferEventRecord {
@@ -36,6 +40,8 @@ impl TransferEventRecord {
             size_bytes: None,
             saved_path: None,
             latency_ms: None,
+            content_kind: None,
+            item_count: None,
         }
     }
 
@@ -50,6 +56,8 @@ impl TransferEventRecord {
             size_bytes: None,
             saved_path: None,
             latency_ms: None,
+            content_kind: None,
+            item_count: None,
         }
     }
 }
@@ -85,25 +93,25 @@ impl TransferController {
         }
     }
 
-    pub fn start_send_wait(&self, file_path: impl Into<String>) {
-        let file_path = PathBuf::from(file_path.into());
+    pub fn start_send_wait(&self, file_paths: Vec<String>) {
+        let file_paths: Vec<PathBuf> = file_paths.into_iter().map(PathBuf::from).collect();
         let queue = self.queue.clone();
         self.start_task(async move {
-            p2p_share_core::sender::run_with_sink(
-                file_path.as_path(),
+            p2p_share_core::sender::run_paths_with_sink(
+                &file_paths,
                 Some(Arc::new(QueueSink { queue }) as Arc<dyn TransferEventSink>),
             )
             .await
         });
     }
 
-    pub fn start_send_to_ticket(&self, file_path: impl Into<String>, ticket: impl Into<String>) {
-        let file_path = PathBuf::from(file_path.into());
+    pub fn start_send_to_ticket(&self, file_paths: Vec<String>, ticket: impl Into<String>) {
+        let file_paths: Vec<PathBuf> = file_paths.into_iter().map(PathBuf::from).collect();
         let ticket = ticket.into();
         let queue = self.queue.clone();
         self.start_task(async move {
-            p2p_share_core::sender::run_reverse_with_sink(
-                file_path.as_path(),
+            p2p_share_core::sender::run_reverse_paths_with_sink(
+                &file_paths,
                 &ticket,
                 Some(Arc::new(QueueSink { queue }) as Arc<dyn TransferEventSink>),
             )
@@ -212,6 +220,8 @@ fn map_event(event: TransferEvent) -> TransferEventRecord {
             size_bytes: None,
             saved_path: None,
             latency_ms: None,
+            content_kind: None,
+            item_count: None,
         },
         TransferEvent::QrPayload(payload) => TransferEventRecord {
             kind: "qr_payload".to_string(),
@@ -223,6 +233,8 @@ fn map_event(event: TransferEvent) -> TransferEventRecord {
             size_bytes: None,
             saved_path: None,
             latency_ms: None,
+            content_kind: None,
+            item_count: None,
         },
         TransferEvent::HandshakeCode(code) => TransferEventRecord {
             kind: "handshake_code".to_string(),
@@ -234,6 +246,8 @@ fn map_event(event: TransferEvent) -> TransferEventRecord {
             size_bytes: None,
             saved_path: None,
             latency_ms: None,
+            content_kind: None,
+            item_count: None,
         },
         TransferEvent::Progress { done, total } => TransferEventRecord {
             kind: "progress".to_string(),
@@ -245,6 +259,8 @@ fn map_event(event: TransferEvent) -> TransferEventRecord {
             size_bytes: None,
             saved_path: None,
             latency_ms: None,
+            content_kind: None,
+            item_count: None,
         },
         TransferEvent::ConnectionPath { kind, latency_ms } => {
             let (value, message) = match kind {
@@ -270,6 +286,8 @@ fn map_event(event: TransferEvent) -> TransferEventRecord {
                 size_bytes: None,
                 saved_path: None,
                 latency_ms,
+                content_kind: None,
+                item_count: None,
             }
         }
         TransferEvent::Completed(result) => TransferEventRecord {
@@ -282,6 +300,11 @@ fn map_event(event: TransferEvent) -> TransferEventRecord {
             size_bytes: Some(result.size_bytes),
             saved_path: result.saved_path.map(|p| p.display().to_string()),
             latency_ms: None,
+            content_kind: Some(match result.content_kind {
+                TransferContentKind::File => "file".to_string(),
+                TransferContentKind::Bundle => "bundle".to_string(),
+            }),
+            item_count: Some(result.item_count),
         },
         TransferEvent::Error { code, message } => TransferEventRecord::error(code, message),
     }
@@ -327,27 +350,33 @@ pub extern "C" fn p2pshare_controller_create() -> u64 {
 }
 
 #[no_mangle]
-pub extern "C" fn p2pshare_controller_start_send_wait(handle: u64, file_path: *const c_char) {
-    let Some(file_path) = cstr_to_string(file_path) else {
+pub extern "C" fn p2pshare_controller_start_send_wait(handle: u64, file_paths_json: *const c_char) {
+    let Some(file_paths_json) = cstr_to_string(file_paths_json) else {
         return;
     };
-    with_controller(handle, |controller| controller.start_send_wait(file_path));
+    let Ok(file_paths) = serde_json::from_str::<Vec<String>>(&file_paths_json) else {
+        return;
+    };
+    with_controller(handle, |controller| controller.start_send_wait(file_paths));
 }
 
 #[no_mangle]
 pub extern "C" fn p2pshare_controller_start_send_to_ticket(
     handle: u64,
-    file_path: *const c_char,
+    file_paths_json: *const c_char,
     ticket: *const c_char,
 ) {
-    let Some(file_path) = cstr_to_string(file_path) else {
+    let Some(file_paths_json) = cstr_to_string(file_paths_json) else {
         return;
     };
     let Some(ticket) = cstr_to_string(ticket) else {
         return;
     };
+    let Ok(file_paths) = serde_json::from_str::<Vec<String>>(&file_paths_json) else {
+        return;
+    };
     with_controller(handle, |controller| {
-        controller.start_send_to_ticket(file_path, ticket)
+        controller.start_send_to_ticket(file_paths, ticket)
     });
 }
 

@@ -9,6 +9,19 @@ import java.io.File
 import java.io.IOException
 
 object FilePrep {
+    fun copyUrisToCacheFiles(context: Context, uris: List<Uri>): List<File> {
+        val copied = mutableListOf<File>()
+        try {
+            for (uri in uris) {
+                copied += copyUriToCacheFile(context, uri)
+            }
+            return copied
+        } catch (err: Throwable) {
+            copied.forEach(File::delete)
+            throw err
+        }
+    }
+
     fun copyUriToCacheFile(context: Context, uri: Uri): File {
         val resolver = context.contentResolver
         val fallbackName = DocumentFile.fromSingleUri(context, uri)?.name ?: "shared-file.bin"
@@ -40,31 +53,76 @@ object FilePrep {
         }
     }
 
-    fun copyReceivedFileToTree(
+    fun copyReceivedEntryToTree(
         context: Context,
         sourcePath: String,
         outputTree: Uri,
         requestedName: String,
     ): Uri? {
         val root = DocumentFile.fromTreeUri(context, outputTree) ?: return null
-        var candidateName = requestedName
-        var index = 1
-        while (root.findFile(candidateName) != null) {
-            candidateName = withSuffixIndex(requestedName, index)
-            index += 1
+        val source = File(sourcePath)
+        return when {
+            source.isDirectory -> copyDirectoryToTree(context, source, root, requestedName)?.uri
+            source.isFile -> copyFileToTree(context, source, root, requestedName)?.uri
+            else -> null
         }
+    }
 
+    private fun copyDirectoryToTree(
+        context: Context,
+        sourceDir: File,
+        root: DocumentFile,
+        requestedName: String,
+    ): DocumentFile? {
+        val outDir = createUniqueDirectory(root, requestedName) ?: return null
+        val children = sourceDir.listFiles().orEmpty().sortedBy { it.name.lowercase() }
+        for (child in children) {
+            val copied = if (child.isDirectory) {
+                copyDirectoryToTree(context, child, outDir, child.name)
+            } else if (child.isFile) {
+                copyFileToTree(context, child, outDir, child.name)
+            } else {
+                continue
+            }
+            if (copied == null) {
+                return null
+            }
+        }
+        return outDir
+    }
+
+    private fun copyFileToTree(
+        context: Context,
+        source: File,
+        root: DocumentFile,
+        requestedName: String,
+    ): DocumentFile? {
+        val candidateName = uniqueChildName(root, requestedName)
         val mime = contentResolverMime(context.contentResolver, requestedName)
         val outDoc = root.createFile(mime, candidateName) ?: return null
 
-        val source = File(sourcePath)
         context.contentResolver.openOutputStream(outDoc.uri)?.use { out ->
             source.inputStream().use { input ->
                 input.copyTo(out)
             }
         } ?: return null
 
-        return outDoc.uri
+        return outDoc
+    }
+
+    private fun createUniqueDirectory(root: DocumentFile, requestedName: String): DocumentFile? {
+        val candidateName = uniqueChildName(root, requestedName)
+        return root.createDirectory(candidateName)
+    }
+
+    private fun uniqueChildName(root: DocumentFile, requestedName: String): String {
+        var candidateName = requestedName
+        var index = 1
+        while (root.findFile(candidateName) != null) {
+            candidateName = withSuffixIndex(requestedName, index)
+            index += 1
+        }
+        return candidateName
     }
 
     private fun withSuffixIndex(name: String, index: Int): String {
@@ -96,8 +154,10 @@ object FilePrep {
                 if (!cursor.moveToFirst()) return@use null
                 val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                 val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
-                val name = if (nameIdx >= 0 && !cursor.isNull(nameIdx)) cursor.getString(nameIdx) else null
-                val size = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else null
+                val name =
+                    if (nameIdx >= 0 && !cursor.isNull(nameIdx)) cursor.getString(nameIdx) else null
+                val size =
+                    if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else null
                 OpenableMeta(name, size)
             }
         }.getOrNull()

@@ -7,6 +7,12 @@ type UiMode = "send" | "receive";
 
 type TransferMode = StartTransferPayload["mode"];
 
+interface SelectedFile {
+  path: string;
+  name: string;
+  size?: number;
+}
+
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => {
   const el = document.getElementById(id);
   if (!el) {
@@ -61,7 +67,7 @@ const eventLog = $<HTMLPreElement>("eventLog");
 
 let mode: UiMode = "send";
 let subMode: TransferMode = "send_wait";
-let filePath = "";
+let selectedFiles: SelectedFile[] = [];
 let isRunning = false;
 let currentTicket = "";
 let logOpen = false;
@@ -185,18 +191,35 @@ function updateDropZoneLabel(text: string): void {
   }
 }
 
-function updateFileDisplay(name?: string | null, size?: number): void {
-  if (name) {
-    const sizeStr = size ? ` (${formatBytes(size)})` : "";
-    fileNameEl.textContent = name + sizeStr;
+function selectionSummary(files: SelectedFile[]): string {
+  if (files.length === 0) {
+    return "";
+  }
+  if (files.length === 1) {
+    const [file] = files;
+    const sizeStr = typeof file.size === "number" ? ` (${formatBytes(file.size)})` : "";
+    return `1 file selected: ${file.name}${sizeStr}`;
+  }
+
+  const preview = files
+    .slice(0, 3)
+    .map((file) => file.name)
+    .join(", ");
+  const suffix = files.length > 3 ? `, +${files.length - 3} more` : "";
+  return `${files.length} files selected: ${preview}${suffix}`;
+}
+
+function updateFileDisplay(files: SelectedFile[]): void {
+  if (files.length > 0) {
+    fileNameEl.textContent = selectionSummary(files);
     fileNameEl.classList.remove("hidden");
     dropZone.classList.add("drop-zone--selected");
-    updateDropZoneLabel("Click to change file");
+    updateDropZoneLabel("Click to change files");
   } else {
     fileNameEl.textContent = "";
     fileNameEl.classList.add("hidden");
     dropZone.classList.remove("drop-zone--selected");
-    updateDropZoneLabel("Drop a file here or click to browse");
+    updateDropZoneLabel("Drop files here or click to browse");
   }
 }
 
@@ -227,8 +250,8 @@ function switchToConfig(): void {
   viewConfig.classList.remove("hidden");
   qrOverlay.classList.add("hidden");
 
-  filePath = "";
-  updateFileDisplay(null);
+  selectedFiles = [];
+  updateFileDisplay([]);
   sendTicketInput.value = "";
   targetInput.value = "";
 }
@@ -236,7 +259,7 @@ function switchToConfig(): void {
 function buildPayload(): StartTransferPayload {
   return {
     mode: subMode,
-    filePath,
+    filePaths: selectedFiles.map((file) => file.path),
     ticket: sendTicketInput.value.trim(),
     target: targetInput.value.trim(),
     outputDir: outputDir.value.trim() || "."
@@ -247,9 +270,9 @@ async function startTransfer(): Promise<void> {
   const desktopApi = getApi();
   if (!desktopApi) return;
 
-  if ((subMode === "send_wait" || subMode === "send_to_ticket") && !filePath) {
+  if ((subMode === "send_wait" || subMode === "send_to_ticket") && selectedFiles.length === 0) {
     flash(dropZone);
-    pushLog("Please select a file to send.");
+    pushLog("Please select one or more files to send.");
     return;
   }
   if (subMode === "send_to_ticket" && !sendTicketInput.value.trim()) {
@@ -324,9 +347,12 @@ function summarizeEvent(evt: TransferEvent): string {
     case "connection_path":
       return `Path: ${typeof evt.value === "string" ? evt.value : "unknown"} ${typeof evt.message === "string" ? `(${evt.message})` : ""}`;
     case "completed": {
-      const fileName = typeof evt.file_name === "string" ? evt.file_name : "file";
+      const itemCount = typeof evt.item_count === "number" ? evt.item_count : 1;
+      const isBundle = evt.content_kind === "bundle" || itemCount > 1;
+      const fileName = typeof evt.file_name === "string" ? evt.file_name : isBundle ? "files" : "file";
       const sizeBytes = typeof evt.size_bytes === "number" ? evt.size_bytes : 0;
-      return `Done: ${fileName} (${formatBytes(sizeBytes)})`;
+      const label = isBundle ? `${itemCount} files -> ${fileName}` : fileName;
+      return `Done: ${label} (${formatBytes(sizeBytes)})`;
     }
     case "error":
       return `Error: ${typeof evt.message === "string" ? evt.message : "unknown"}`;
@@ -395,9 +421,13 @@ function handleTransferEvent(evt: TransferEvent): void {
       p2pViz.classList.add("p2p-viz--done");
 
       completeSummary.classList.remove("hidden");
-      const fileName = typeof evt.file_name === "string" ? evt.file_name : "File";
+      const itemCount = typeof evt.item_count === "number" ? evt.item_count : 1;
+      const isBundle = evt.content_kind === "bundle" || itemCount > 1;
+      const fileName = typeof evt.file_name === "string" ? evt.file_name : isBundle ? "Files" : "File";
       const sizeBytes = typeof evt.size_bytes === "number" ? evt.size_bytes : 0;
-      let detail = `${fileName} (${formatBytes(sizeBytes)})`;
+      let detail = isBundle
+        ? `${itemCount} files in ${fileName} (${formatBytes(sizeBytes)})`
+        : `${fileName} (${formatBytes(sizeBytes)})`;
 
       const savedPath =
         typeof evt.saved_path === "string"
@@ -448,11 +478,13 @@ document.querySelectorAll<HTMLButtonElement>(".variant-btn").forEach((btn) => {
 dropZone.addEventListener("click", async () => {
   const desktopApi = getApi();
   if (!desktopApi) return;
-  const selected = await desktopApi.pickFile();
-  if (selected) {
-    filePath = selected;
-    const name = selected.split(/[\\/]/).pop();
-    updateFileDisplay(name);
+  const picked = await desktopApi.pickFiles();
+  if (picked && picked.length > 0) {
+    selectedFiles = picked.map((path) => ({
+      path,
+      name: path.split(/[\\/]/).pop() || path
+    }));
+    updateFileDisplay(selectedFiles);
   }
 });
 
@@ -473,15 +505,27 @@ dropZone.addEventListener("drop", (e: DragEvent) => {
   e.stopPropagation();
   dropZone.classList.remove("drop-zone--hover");
 
-  const file = e.dataTransfer?.files?.[0];
-  if (!file) return;
+  const files = Array.from(e.dataTransfer?.files ?? []);
+  if (files.length === 0) return;
 
   if (api && api.getPathForFile) {
     try {
-      const droppedPath = api.getPathForFile(file);
-      if (droppedPath) {
-        filePath = droppedPath;
-        updateFileDisplay(file.name, file.size);
+      const droppedFiles = files
+        .map((file): SelectedFile | null => {
+          const path = api.getPathForFile(file);
+          if (!path) {
+            return null;
+          }
+          return {
+            path,
+            name: file.name,
+            size: file.size
+          };
+        })
+        .filter((file): file is SelectedFile => file !== null);
+      if (droppedFiles.length === files.length) {
+        selectedFiles = droppedFiles;
+        updateFileDisplay(selectedFiles);
         return;
       }
     } catch {
@@ -489,7 +533,7 @@ dropZone.addEventListener("drop", (e: DragEvent) => {
     }
   }
 
-  pushLog("Could not resolve file path from drop. Please use the browse button.");
+  pushLog("Could not resolve all dropped file paths. Please use the browse button.");
 });
 
 document.body.addEventListener("dragover", (e: DragEvent) => e.preventDefault());

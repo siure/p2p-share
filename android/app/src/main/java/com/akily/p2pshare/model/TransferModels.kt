@@ -41,12 +41,14 @@ data class TransferUiState(
     val completedName: String? = null,
     val completedSize: Long? = null,
     val completedPath: String? = null,
+    val completedContentKind: String? = null,
+    val completedItemCount: Long = 1,
     val errorMessage: String? = null,
 )
 
 data class SendFormState(
-    val fileUri: Uri? = null,
-    val preparedPath: String? = null,
+    val fileUris: List<Uri> = emptyList(),
+    val preparedPaths: List<String> = emptyList(),
     val sendToTicketMode: Boolean = false,
     val ticketInput: String = "",
 )

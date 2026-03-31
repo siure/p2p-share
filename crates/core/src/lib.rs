@@ -1,3 +1,4 @@
+pub mod bundle;
 pub mod crypto;
 pub mod events;
 pub mod progress;
@@ -7,5 +8,6 @@ pub mod sender;
 pub mod ticket;
 
 pub use events::{
-    ConnectionPathKind, TransferCompleted, TransferEvent, TransferEventSink, TransferMode,
+    ConnectionPathKind, TransferCompleted, TransferContentKind, TransferEvent, TransferEventSink,
+    TransferMode,
 };

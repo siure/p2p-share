@@ -13,13 +13,15 @@ data class BridgeEvent(
     val sizeBytes: Long? = null,
     val savedPath: String? = null,
     val latencyMs: Double? = null,
+    val contentKind: String? = null,
+    val itemCount: Long? = null,
 )
 
 interface TransferEngine {
     val usingRust: Boolean
 
-    fun startSendWait(filePath: String)
-    fun startSendToTicket(filePath: String, ticket: String)
+    fun startSendWait(filePaths: List<String>)
+    fun startSendToTicket(filePaths: List<String>, ticket: String)
     fun startReceiveTarget(target: String, outputDir: String)
     fun startReceiveListen(outputDir: String)
     fun pollEvent(): BridgeEvent?
@@ -32,11 +34,11 @@ class DemoTransferEngine : TransferEngine {
     @Volatile
     private var canceled = false
 
-    override fun startSendWait(filePath: String) {
+    override fun startSendWait(filePaths: List<String>) {
         runDemo("send", withTicket = true)
     }
 
-    override fun startSendToTicket(filePath: String, ticket: String) {
+    override fun startSendToTicket(filePaths: List<String>, ticket: String) {
         runDemo("send", withTicket = false)
     }
 
@@ -88,6 +90,8 @@ class DemoTransferEngine : TransferEngine {
                     fileName = fileName,
                     sizeBytes = total,
                     savedPath = savedPath,
+                    contentKind = "file",
+                    itemCount = 1,
                 )
             )
             queue.add(BridgeEvent(kind = "status", message = "Checksum verified (blake3)."))

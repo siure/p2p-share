@@ -23,10 +23,10 @@ fn json_mode_emits_status_and_error_events_for_invalid_receive_invocation() {
 
     let events = parse_json_events(&output.stdout);
     assert!(
-        events
-            .iter()
-            .any(|evt| evt.get("kind").and_then(Value::as_str) == Some("status")
-                && evt.get("message").and_then(Value::as_str) == Some("Transfer started.")),
+        events.iter().any(
+            |evt| evt.get("kind").and_then(Value::as_str) == Some("status")
+                && evt.get("message").and_then(Value::as_str) == Some("Transfer started.")
+        ),
         "expected a startup status event in stdout JSON stream"
     );
 

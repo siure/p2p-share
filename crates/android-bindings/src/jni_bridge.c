@@ -2,10 +2,10 @@
 #include <stdint.h>
 
 extern uint64_t p2pshare_controller_create(void);
-extern void p2pshare_controller_start_send_wait(uint64_t handle, const char *file_path);
+extern void p2pshare_controller_start_send_wait(uint64_t handle, const char *file_paths_json);
 extern void p2pshare_controller_start_send_to_ticket(
     uint64_t handle,
-    const char *file_path,
+    const char *file_paths_json,
     const char *ticket
 );
 extern void p2pshare_controller_start_receive_target(
@@ -28,39 +28,39 @@ static void native_start_send_wait(
     JNIEnv *env,
     jclass clazz,
     jlong handle,
-    jstring file_path
+    jstring file_paths_json
 ) {
     (void) clazz;
-    if (file_path == NULL) return;
-    const char *path = (*env)->GetStringUTFChars(env, file_path, NULL);
-    if (path == NULL) return;
-    p2pshare_controller_start_send_wait((uint64_t) handle, path);
-    (*env)->ReleaseStringUTFChars(env, file_path, path);
+    if (file_paths_json == NULL) return;
+    const char *paths = (*env)->GetStringUTFChars(env, file_paths_json, NULL);
+    if (paths == NULL) return;
+    p2pshare_controller_start_send_wait((uint64_t) handle, paths);
+    (*env)->ReleaseStringUTFChars(env, file_paths_json, paths);
 }
 
 static void native_start_send_to_ticket(
     JNIEnv *env,
     jclass clazz,
     jlong handle,
-    jstring file_path,
+    jstring file_paths_json,
     jstring ticket
 ) {
     (void) clazz;
-    if (file_path == NULL || ticket == NULL) return;
+    if (file_paths_json == NULL || ticket == NULL) return;
 
-    const char *path = (*env)->GetStringUTFChars(env, file_path, NULL);
-    if (path == NULL) return;
+    const char *paths = (*env)->GetStringUTFChars(env, file_paths_json, NULL);
+    if (paths == NULL) return;
 
     const char *ticket_str = (*env)->GetStringUTFChars(env, ticket, NULL);
     if (ticket_str == NULL) {
-        (*env)->ReleaseStringUTFChars(env, file_path, path);
+        (*env)->ReleaseStringUTFChars(env, file_paths_json, paths);
         return;
     }
 
-    p2pshare_controller_start_send_to_ticket((uint64_t) handle, path, ticket_str);
+    p2pshare_controller_start_send_to_ticket((uint64_t) handle, paths, ticket_str);
 
     (*env)->ReleaseStringUTFChars(env, ticket, ticket_str);
-    (*env)->ReleaseStringUTFChars(env, file_path, path);
+    (*env)->ReleaseStringUTFChars(env, file_paths_json, paths);
 }
 
 static void native_start_receive_target(

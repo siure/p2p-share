@@ -1,6 +1,7 @@
 package com.akily.p2pshare.bridge
 
 import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 
 class NativeTransferController private constructor(
@@ -8,12 +9,12 @@ class NativeTransferController private constructor(
 ) : TransferEngine {
     override val usingRust: Boolean = true
 
-    override fun startSendWait(filePath: String) {
-        RustBindings.nativeStartSendWait(handle, filePath)
+    override fun startSendWait(filePaths: List<String>) {
+        RustBindings.nativeStartSendWait(handle, JSONArray(filePaths).toString())
     }
 
-    override fun startSendToTicket(filePath: String, ticket: String) {
-        RustBindings.nativeStartSendToTicket(handle, filePath, ticket)
+    override fun startSendToTicket(filePaths: List<String>, ticket: String) {
+        RustBindings.nativeStartSendToTicket(handle, JSONArray(filePaths).toString(), ticket)
     }
 
     override fun startReceiveTarget(target: String, outputDir: String) {
@@ -37,16 +38,21 @@ class NativeTransferController private constructor(
         val json = JSONObject(this)
         return BridgeEvent(
             kind = json.optString("kind"),
-            message = json.optString("message", null),
-            value = json.optString("value", null),
+            message = json.optNullableString("message"),
+            value = json.optNullableString("value"),
             done = if (json.has("done") && !json.isNull("done")) json.optLong("done") else null,
             total = if (json.has("total") && !json.isNull("total")) json.optLong("total") else null,
-            fileName = json.optString("file_name", null),
+            fileName = json.optNullableString("file_name"),
             sizeBytes = if (json.has("size_bytes") && !json.isNull("size_bytes")) json.optLong("size_bytes") else null,
-            savedPath = json.optString("saved_path", null),
+            savedPath = json.optNullableString("saved_path"),
             latencyMs = if (json.has("latency_ms") && !json.isNull("latency_ms")) json.optDouble("latency_ms") else null,
+            contentKind = json.optNullableString("content_kind"),
+            itemCount = if (json.has("item_count") && !json.isNull("item_count")) json.optLong("item_count") else null,
         )
     }
+
+    private fun JSONObject.optNullableString(key: String): String? =
+        if (has(key) && !isNull(key)) optString(key) else null
 
     companion object {
         private const val TAG = "P2PShareNative"

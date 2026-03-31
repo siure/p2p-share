@@ -9,8 +9,11 @@ use n0_future::StreamExt;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
+use crate::bundle;
 use crate::crypto;
-use crate::events::{ConnectionPathKind, TransferCompleted, TransferEvent, TransferEventSink};
+use crate::events::{
+    ConnectionPathKind, TransferCompleted, TransferContentKind, TransferEvent, TransferEventSink,
+};
 use crate::progress::transfer_progress_bar;
 use crate::protocol::{human_bytes, FileHeader};
 use crate::ticket;
@@ -160,6 +163,16 @@ fn print_qr(data: &str) {
             eprintln!("    {}", line);
         }
     }
+}
+
+fn bundle_logical_name(header: &FileHeader) -> String {
+    header
+        .logical_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| bundle::logical_name_from_wire_name(&header.name))
 }
 
 /// Run the receive side: connect to the sender (via iroh ticket or ip:port),
@@ -320,7 +333,10 @@ pub async fn run_listen_with_sink(output_dir: &Path, sink: Option<SharedSink>) -
     eprintln!();
     print_qr(&ticket_str);
     eprintln!();
-    eprintln!("  Or run:\n\n    p2p-share send --to {} <FILE>", ticket_str);
+    eprintln!(
+        "  Or run:\n\n    p2p-share send --to {} <FILE>...",
+        ticket_str
+    );
     eprintln!();
     status(sink.as_ref(), "Waiting for sender to connect...");
 
@@ -393,24 +409,49 @@ where
     }
 
     let header = FileHeader::from_wire(&header_str)?;
+    let content_kind = header.content_kind.unwrap_or(TransferContentKind::File);
+    let item_count = header.item_count.unwrap_or(1).max(1);
+    let completed_name = if content_kind == TransferContentKind::Bundle {
+        bundle_logical_name(&header)
+    } else {
+        header.name.clone()
+    };
 
     eprintln!();
-    status(
-        sink,
+    let incoming_status = if content_kind == TransferContentKind::Bundle {
+        format!(
+            "Incoming files: {} ({} files, {})",
+            completed_name,
+            item_count,
+            human_bytes(header.size)
+        )
+    } else {
         format!(
             "Incoming file: {} ({})",
             header.name,
             human_bytes(header.size)
-        ),
-    );
+        )
+    };
+    status(sink, incoming_status);
 
     crypto::encrypted_write(writer, transport, b"OK\n").await?;
 
     tokio::fs::create_dir_all(output_dir).await?;
-    let dest = unique_path(output_dir, &header.name);
     let temp_dest = unique_path(output_dir, &format!("{}.part", header.name));
+    let final_dest = if content_kind == TransferContentKind::Bundle {
+        unique_path(output_dir, &completed_name)
+    } else {
+        unique_path(output_dir, &header.name)
+    };
 
-    status(sink, format!("Saving to: {}", dest.display()));
+    if content_kind == TransferContentKind::Bundle {
+        status(
+            sink,
+            format!("Saving extracted files to: {}", final_dest.display()),
+        );
+    } else {
+        status(sink, format!("Saving to: {}", final_dest.display()));
+    }
     eprintln!();
 
     let mut file = File::create(&temp_dest).await?;
@@ -421,7 +462,7 @@ where
     };
     let mut received: u64 = 0;
     let mut hasher = blake3::Hasher::new();
-    let receive_result: Result<()> = async {
+    let receive_result: Result<(PathBuf, u64)> = async {
         while received < header.size {
             let plaintext = crypto::encrypted_read(reader, transport).await?;
             if plaintext.is_empty() {
@@ -466,33 +507,55 @@ where
             );
         }
 
-        tokio::fs::rename(&temp_dest, &dest).await?;
+        let final_count = if content_kind == TransferContentKind::Bundle {
+            let extracted = bundle::extract_bundle(&temp_dest, &final_dest).await?;
+            tokio::fs::remove_file(&temp_dest).await?;
+            extracted
+        } else {
+            tokio::fs::rename(&temp_dest, &final_dest).await?;
+            1
+        };
         crypto::encrypted_write(writer, transport, b"DONE\n").await?;
-        Ok(())
+        Ok((final_dest.clone(), final_count))
     }
     .await;
 
-    if let Err(err) = receive_result {
-        let _ = tokio::fs::remove_file(&temp_dest).await;
-        return Err(err);
-    }
+    let (saved_path, completed_count) = match receive_result {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&temp_dest).await;
+            if content_kind == TransferContentKind::Bundle {
+                let _ = tokio::fs::remove_dir_all(&final_dest).await;
+            }
+            return Err(err);
+        }
+    };
 
     eprintln!();
-    status(
-        sink,
+    let success_status = if content_kind == TransferContentKind::Bundle {
+        format!(
+            "Files received successfully: {} ({} files, {})",
+            saved_path.display(),
+            completed_count,
+            human_bytes(header.size)
+        )
+    } else {
         format!(
             "File received successfully: {} ({})",
-            dest.display(),
+            saved_path.display(),
             human_bytes(header.size)
-        ),
-    );
+        )
+    };
+    status(sink, success_status);
     status(sink, "Checksum verified (blake3).");
     emit(
         sink,
         TransferEvent::Completed(TransferCompleted {
-            file_name: header.name,
+            file_name: completed_name,
             size_bytes: header.size,
-            saved_path: Some(dest),
+            saved_path: Some(saved_path),
+            content_kind,
+            item_count: completed_count,
         }),
     );
 

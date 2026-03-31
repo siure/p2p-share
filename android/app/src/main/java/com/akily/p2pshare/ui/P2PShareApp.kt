@@ -124,9 +124,9 @@ fun P2PShareApp(viewModel: TransferViewModel) {
         initialPage = pageForTab(selectedTab),
         pageCount = { tabs.size },
     )
-    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        viewModel.setFileUri(uri)
-        viewModel.prepareSendFile(uri)
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        viewModel.setFileUris(uris)
+        viewModel.prepareSendFiles(uris)
     }
 
     val outputPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
@@ -243,7 +243,7 @@ fun P2PShareApp(viewModel: TransferViewModel) {
                                 latencyMs = pageUi.latencyMs,
                                 sendToTicket = send.sendToTicketMode,
                                 ticketInput = send.ticketInput,
-                                selectedFile = viewModel.describeFileUri(send.fileUri),
+                                selectedFile = viewModel.describeFileUris(send.fileUris),
                                 canCancelSend = viewModel.canCancelSend(),
                                 showProgress = pageUi.stage == TransferStage.TRANSFERRING || pageUi.progressTotal > 0,
                                 progressDone = pageUi.progressDone,
@@ -525,10 +525,11 @@ private fun TransferPanel(ui: TransferUiState, selectedTab: TransferTab) {
         val name = ui.completedName ?: return@AnimatedVisibility
         val size = ui.completedSize ?: 0
         val path = ui.completedPath
+        val itemCount = ui.completedItemCount
         if (selectedTab == TransferTab.SEND) {
-            SendCompletedCard(name = name, size = size)
+            SendCompletedCard(name = name, size = size, itemCount = itemCount)
         } else if (selectedTab == TransferTab.RECEIVE && !path.isNullOrBlank()) {
-            ReceiveCompletedCard(name = name, size = size, path = path)
+            ReceiveCompletedCard(name = name, size = size, path = path, itemCount = itemCount)
         }
     }
 }
@@ -596,9 +597,9 @@ private fun SendScreen(
     onCancelSend: () -> Unit,
 ) {
     GlassCard(accent = ElectricBlue, label = "Send") {
-        Text("Share a file", style = MaterialTheme.typography.titleLarge)
+        Text("Share files", style = MaterialTheme.typography.titleLarge)
         Text(
-            "Choose a file, then share by receiver ticket or by waiting for a connection.",
+            "Choose one or more files, then share by receiver ticket or by waiting for a connection.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -612,15 +613,15 @@ private fun SendScreen(
         )
 
         SecondaryActionButton(
-            label = "Choose file",
+            label = "Choose files",
             icon = Icons.Default.AttachFile,
             onClick = onPickFile,
         )
 
         PathStrip(
-            text = truncateFileNameKeepExtension(selectedFile),
-            fallback = "No file selected",
-            maxLines = 1,
+            text = truncateMiddle(selectedFile, head = 42, tail = 18),
+            fallback = "No files selected",
+            maxLines = 2,
         )
 
         if (sendToTicket) {
@@ -680,7 +681,7 @@ private fun ReceiveScreen(
     onCancelReceive: () -> Unit,
 ) {
     GlassCard(accent = NeonCyan, label = "Receive") {
-        Text("Accept a file", style = MaterialTheme.typography.titleLarge)
+        Text("Accept files", style = MaterialTheme.typography.titleLarge)
         Text(
             "Connect to a sender ticket or start listening and share your QR code.",
             style = MaterialTheme.typography.bodySmall,
@@ -953,11 +954,19 @@ private fun ConnectInviteCard(ticket: String?, qrPayload: String?) {
 }
 
 @Composable
-private fun SendCompletedCard(name: String, size: Long) {
+private fun SendCompletedCard(name: String, size: Long, itemCount: Long) {
     GlassCard(accent = SignalGreen, label = "Completed") {
-        Text("File sent", style = MaterialTheme.typography.titleMedium, color = SignalGreen)
         Text(
-            "${truncateMiddle(name, head = 34, tail = 0)} (${humanBytes(size)})",
+            if (itemCount > 1) "Files sent" else "File sent",
+            style = MaterialTheme.typography.titleMedium,
+            color = SignalGreen,
+        )
+        Text(
+            if (itemCount > 1) {
+                "$itemCount files in ${truncateMiddle(name, head = 28, tail = 0)} (${humanBytes(size)})"
+            } else {
+                "${truncateMiddle(name, head = 34, tail = 0)} (${humanBytes(size)})"
+            },
             style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -966,11 +975,19 @@ private fun SendCompletedCard(name: String, size: Long) {
 }
 
 @Composable
-private fun ReceiveCompletedCard(name: String, size: Long, path: String) {
+private fun ReceiveCompletedCard(name: String, size: Long, path: String, itemCount: Long) {
     GlassCard(accent = SignalGreen, label = "Completed") {
-        Text("File received", style = MaterialTheme.typography.titleMedium, color = SignalGreen)
         Text(
-            "${truncateMiddle(name, head = 32, tail = 0)} (${humanBytes(size)})",
+            if (itemCount > 1) "Files received" else "File received",
+            style = MaterialTheme.typography.titleMedium,
+            color = SignalGreen,
+        )
+        Text(
+            if (itemCount > 1) {
+                "$itemCount files in ${truncateMiddle(name, head = 26, tail = 0)} (${humanBytes(size)})"
+            } else {
+                "${truncateMiddle(name, head = 32, tail = 0)} (${humanBytes(size)})"
+            },
             style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
