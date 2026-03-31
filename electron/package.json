@@ -1,6 +1,6 @@
 {
   "name": "p2p-share-electron",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "private": true,
   "author": "p2p-share contributors",
   "description": "Electron desktop GUI for p2p-share",
