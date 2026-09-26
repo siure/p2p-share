@@ -99,21 +99,46 @@ pub async fn encrypted_write<W: AsyncWrite + Unpin>(
     transport: &mut TransportState,
     plaintext: &[u8],
 ) -> Result<()> {
-    let mut ciphertext = vec![0u8; plaintext.len() + 16]; // 16-byte AEAD tag
-    let len = transport.write_message(plaintext, &mut ciphertext)?;
+    encrypted_write_with_buffer(writer, transport, plaintext, &mut Vec::new()).await
+}
+
+/// Encrypt a frame using storage retained by the transfer loop.
+pub async fn encrypted_write_with_buffer<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    transport: &mut TransportState,
+    plaintext: &[u8],
+    ciphertext: &mut Vec<u8>,
+) -> Result<()> {
+    if plaintext.len() > NOISE_MAX_MSG - 16 {
+        bail!("plaintext frame too large");
+    }
+    ciphertext.resize(plaintext.len() + 16, 0);
+    let len = transport.write_message(plaintext, ciphertext)?;
     send_frame(writer, &ciphertext[..len]).await
 }
 
-/// Read a length-prefixed encrypted frame, decrypt it, return the plaintext.
+/// Read and decrypt one control frame.
 pub async fn encrypted_read<R: AsyncRead + Unpin>(
     reader: &mut R,
     transport: &mut TransportState,
 ) -> Result<Vec<u8>> {
-    let ciphertext = recv_frame(reader).await?;
-    let mut plaintext = vec![0u8; ciphertext.len()];
-    let len = transport.read_message(&ciphertext, &mut plaintext)?;
-    plaintext.truncate(len);
+    let mut plaintext = Vec::new();
+    encrypted_read_with_buffers(reader, transport, &mut Vec::new(), &mut plaintext).await?;
     Ok(plaintext)
+}
+
+/// Reuse both frame buffers; plaintext contains only the authenticated bytes.
+pub async fn encrypted_read_with_buffers<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    transport: &mut TransportState,
+    ciphertext: &mut Vec<u8>,
+    plaintext: &mut Vec<u8>,
+) -> Result<usize> {
+    recv_frame_into(reader, ciphertext).await?;
+    plaintext.resize(ciphertext.len(), 0);
+    let len = transport.read_message(ciphertext, plaintext)?;
+    plaintext.truncate(len);
+    Ok(len)
 }
 
 // ─── Raw framing helpers ────────────────────────────────────────────────────
@@ -132,13 +157,67 @@ async fn send_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> Resul
 
 /// Read a length-prefixed frame.
 async fn recv_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+    let mut frame = Vec::new();
+    recv_frame_into(reader, &mut frame).await?;
+    Ok(frame)
+}
+
+async fn recv_frame_into<R: AsyncRead + Unpin>(reader: &mut R, frame: &mut Vec<u8>) -> Result<()> {
     let mut len_bytes = [0u8; 4];
     reader.read_exact(&mut len_bytes).await?;
     let len = u32::from_be_bytes(len_bytes) as usize;
     if len > NOISE_MAX_MSG {
         bail!("frame too large: {} bytes", len);
     }
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).await?;
-    Ok(buf)
+    frame.resize(len, 0);
+    reader.read_exact(frame).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reused_buffers_handle_different_lengths_and_reject_corruption() {
+        let (mut left, mut right) = tokio::io::duplex(128 * 1024);
+        let (mut left_read, mut left_write) = tokio::io::split(&mut left);
+        let (mut right_read, mut right_write) = tokio::io::split(&mut right);
+        let (initiator, responder) = tokio::join!(
+            handshake_initiator(&mut left_read, &mut left_write),
+            handshake_responder(&mut right_read, &mut right_write)
+        );
+        let (mut sender, _) = initiator.unwrap();
+        let (mut receiver, _) = responder.unwrap();
+        let mut send_buffer = Vec::new();
+        let mut cipher = Vec::new();
+        let mut plain = Vec::new();
+        for payload in [vec![42; 60 * 1024], vec![7; 3], vec![9; 1024]] {
+            encrypted_write_with_buffer(&mut left_write, &mut sender, &payload, &mut send_buffer)
+                .await
+                .unwrap();
+            let len = encrypted_read_with_buffers(
+                &mut right_read,
+                &mut receiver,
+                &mut cipher,
+                &mut plain,
+            )
+            .await
+            .unwrap();
+            assert_eq!(len, payload.len());
+            assert_eq!(plain, payload);
+        }
+        let mut bad = vec![0; 32];
+        let len = sender.write_message(b"tamper", &mut bad).unwrap();
+        bad[0] ^= 1;
+        send_frame(&mut left_write, &bad[..len]).await.unwrap();
+        assert!(encrypted_read_with_buffers(
+            &mut right_read,
+            &mut receiver,
+            &mut cipher,
+            &mut plain
+        )
+        .await
+        .is_err());
+    }
 }

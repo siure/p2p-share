@@ -70,10 +70,16 @@ let subMode: TransferMode = "send_wait";
 let selectedFiles: SelectedFile[] = [];
 let isRunning = false;
 let currentTicket = "";
+let ticketRequest = 0;
 let logOpen = false;
 let transferSchemaWarningShown = false;
 let platformLabel = "Unknown platform";
 let buildInfoLabel = "";
+const logLines: string[] = [];
+const MAX_LOG_LINES = 200;
+let logFrame: number | null = null;
+let progressFrame: number | null = null;
+let pendingProgress: { done: number; total: number } | null = null;
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -142,9 +148,32 @@ function nowTime(): string {
   return new Date().toLocaleTimeString();
 }
 
+function renderLog(): void {
+  if (!logOpen || logFrame !== null) return;
+  logFrame = requestAnimationFrame(() => {
+    logFrame = null;
+    if (!logOpen) return;
+    eventLog.textContent = logLines.join("\n");
+    eventLog.scrollTop = eventLog.scrollHeight;
+  });
+}
+
 function pushLog(text: string): void {
-  eventLog.textContent += `[${nowTime()}] ${text}\n`;
-  eventLog.scrollTop = eventLog.scrollHeight;
+  logLines.push(`[${nowTime()}] ${text.slice(0, 2000)}`);
+  if (logLines.length > MAX_LOG_LINES) logLines.shift();
+  renderLog();
+}
+
+function flushProgress(): void {
+  if (progressFrame !== null) cancelAnimationFrame(progressFrame);
+  progressFrame = null;
+  if (!pendingProgress) return;
+  const { done, total } = pendingProgress;
+  pendingProgress = null;
+  const pct = total > 0 ? Math.min(100, (done / total) * 100) : 0;
+  progressFill.style.width = `${pct.toFixed(1)}%`;
+  progressPercent.textContent = `${Math.round(pct)}%`;
+  progressDetail.textContent = `${formatBytes(done)} / ${formatBytes(total)}`;
 }
 
 function flash(el: HTMLElement): void {
@@ -223,7 +252,17 @@ function updateFileDisplay(files: SelectedFile[]): void {
   }
 }
 
+function resetTransferVisuals(): void {
+  pendingProgress = null;
+  flushProgress();
+  ticketRequest += 1;
+  currentTicket = "";
+  qrImage.removeAttribute("src");
+  qrOverlayImage.removeAttribute("src");
+}
+
 function switchToTransfer(): void {
+  resetTransferVisuals();
   viewConfig.classList.add("hidden");
   viewTransfer.classList.remove("hidden");
 
@@ -246,6 +285,7 @@ function switchToTransfer(): void {
 }
 
 function switchToConfig(): void {
+  resetTransferVisuals();
   viewTransfer.classList.add("hidden");
   viewConfig.classList.remove("hidden");
   qrOverlay.classList.add("hidden");
@@ -267,6 +307,7 @@ function buildPayload(): StartTransferPayload {
 }
 
 async function startTransfer(): Promise<void> {
+  if (isRunning) return;
   const desktopApi = getApi();
   if (!desktopApi) return;
 
@@ -306,7 +347,11 @@ async function startTransfer(): Promise<void> {
 }
 
 async function setTicketVisual(ticket: string): Promise<void> {
+  if (ticket === currentTicket) return;
+  const request = ++ticketRequest;
   currentTicket = ticket || "";
+  qrImage.removeAttribute("src");
+  qrOverlayImage.removeAttribute("src");
   ticketValue.textContent = currentTicket || "Generating...";
 
   if (!currentTicket) {
@@ -320,12 +365,12 @@ async function setTicketVisual(ticket: string): Promise<void> {
     const desktopApi = getApi();
     if (!desktopApi) return;
     const qrDataUrl = await desktopApi.createQrDataUrl(currentTicket);
-    if (qrDataUrl) {
+    if (qrDataUrl && ticketRequest === request) {
       qrImage.src = qrDataUrl;
       qrOverlayImage.src = qrDataUrl;
     }
   } catch (err) {
-    pushLog(`QR generation failed: ${errorMessage(err)}`);
+    if (ticketRequest === request) pushLog(`QR generation failed: ${errorMessage(err)}`);
   }
 }
 
@@ -379,7 +424,8 @@ function handleTransferEvent(evt: TransferEvent): void {
     }
   }
 
-  pushLog(summarizeEvent(evt));
+  if (evt.kind !== "progress") pushLog(summarizeEvent(evt));
+  if (evt.kind === "completed" || evt.kind === "error" || evt.kind === "process_end") flushProgress();
 
   switch (evt.kind) {
     case "status":
@@ -396,12 +442,11 @@ function handleTransferEvent(evt: TransferEvent): void {
       break;
 
     case "progress": {
-      const done = typeof evt.done === "number" ? evt.done : 0;
-      const total = typeof evt.total === "number" ? evt.total : 0;
-      const pct = total > 0 ? Math.min(100, (done / total) * 100) : 0;
-      progressFill.style.width = `${pct.toFixed(1)}%`;
-      progressPercent.textContent = `${Math.round(pct)}%`;
-      progressDetail.textContent = `${formatBytes(done)} / ${formatBytes(total)}`;
+      pendingProgress = {
+        done: typeof evt.done === "number" ? evt.done : 0,
+        total: typeof evt.total === "number" ? evt.total : 0
+      };
+      progressFrame ??= requestAnimationFrame(flushProgress);
       break;
     }
 
@@ -610,9 +655,11 @@ logToggle.addEventListener("click", () => {
   logOpen = !logOpen;
   logPanel.classList.toggle("hidden", !logOpen);
   logChevron.classList.toggle("log-chevron--open", logOpen);
+  renderLog();
 });
 
 clearLogBtn.addEventListener("click", () => {
+  logLines.length = 0;
   eventLog.textContent = "";
 });
 

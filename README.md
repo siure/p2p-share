@@ -2,6 +2,13 @@
 
 Encrypted peer-to-peer file transfer with a shared Rust core and two frontends.
 
+Version 0.4 uses iroh 1.x. Update both devices before transferring: tickets from
+0.3.x are incompatible. A ticket belongs to one transfer and expires when that
+transfer finishes or is canceled.
+
+See the [performance audit](docs/performance-audit.md) for measured results,
+implemented fixes, and remaining bottlenecks.
+
 ## Projects
 
 - `crates/core`: transfer engine and protocol logic
@@ -25,6 +32,10 @@ cd android
 ./gradlew assembleDebug
 ```
 
+Android builds regenerate the Rust libraries into the build directory. Install
+`cargo-ndk`, the Android Rust targets, and an Android NDK first; see
+[`android/scripts/build-rust-android.sh`](android/scripts/build-rust-android.sh).
+
 Run desktop GUI:
 
 ```bash
@@ -36,6 +47,9 @@ npm run dev
 Desktop GUI notes:
 
 - The GUI runs the existing Rust CLI under the hood using structured JSON events (`--json`).
+- The GUI keeps one Rust worker and network endpoint alive between transfers.
+  Direct connection tickets appear as soon as a LAN address is available; relay
+  discovery continues in the background and refreshes the ticket.
 - It supports all transfer modes:
   - send and wait (`send <FILE>...`)
   - send to receiver ticket (`send <FILE>... --to <TICKET>`)
@@ -49,6 +63,8 @@ cargo build --release -p p2p-share
 
 - Packaging scripts are available in `electron/package.json` (`dist:win`, `dist:linux`). Build each target on its native OS for the most reliable results.
 - Packaged desktop builds include the CLI binary inside the app (`resources/bin/<os>/<arch>`), so they run standalone.
+- Linux users can run the unpacked distribution to avoid AppImage mount and
+  decompression overhead. See the [desktop instructions](electron/README.md).
 - If you run the GUI from source and auto-detection fails, set `P2P_SHARE_CLI_PATH` to a built binary path before launching Electron.
 
 Run tests:
@@ -56,6 +72,19 @@ Run tests:
 ```bash
 cargo test --workspace --all-targets
 ```
+
+Desktop checks:
+
+```bash
+cd electron
+npm run typecheck
+npm run test:worker
+npm run build
+```
+
+The Rust integration tests exercise worker reuse, cancellation, normal and
+reverse transfers, and verified multi-file bundles. Desktop tests cover worker
+reuse, stale events, crashes, and cancellation timeouts.
 
 ## CI/CD
 

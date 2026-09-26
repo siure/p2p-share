@@ -1,6 +1,11 @@
 use std::collections::HashSet;
 use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -10,22 +15,115 @@ use time::OffsetDateTime;
 
 pub const BUNDLE_EXTENSION: &str = ".p2pshare-bundle.tar";
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BundleBuild {
     pub bundle_path: PathBuf,
     pub logical_name: String,
     pub item_count: u64,
+    pub hash: String,
+    cleanup: BundleCleanup,
+}
+
+impl BundleBuild {
+    /// Transfer ownership of the archive to the caller, which must remove it.
+    pub fn into_path(mut self) -> PathBuf {
+        self.cleanup.0.take().expect("bundle owns its archive")
+    }
+}
+
+#[derive(Debug)]
+struct BundleCleanup(Option<PathBuf>);
+
+impl Drop for BundleCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+struct CancellableReader<'a, R> {
+    inner: R,
+    canceled: &'a AtomicBool,
+}
+
+impl<R: Read> Read for CancellableReader<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if self.canceled.load(Ordering::Relaxed) {
+            return Err(io::Error::other("bundle operation canceled"));
+        }
+        self.inner.read(bytes)
+    }
+}
+
+struct ExtractedBundle {
+    directory: PathBuf,
+    item_count: u64,
+}
+
+impl Drop for ExtractedBundle {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
 }
 
 pub async fn create_bundle(paths: &[PathBuf]) -> Result<BundleBuild> {
     let input_paths = paths.to_vec();
-    tokio::task::spawn_blocking(move || create_bundle_blocking(&input_paths)).await?
+    let canceled = Arc::new(AtomicBool::new(false));
+    let _cancel = CancelOnDrop(canceled.clone());
+    tokio::task::spawn_blocking(move || create_bundle_cancellable(&input_paths, &canceled)).await?
 }
 
 pub async fn extract_bundle(bundle_path: &Path, output_dir: &Path) -> Result<u64> {
-    let bundle_path = bundle_path.to_path_buf();
-    let output_dir = output_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || extract_bundle_blocking(&bundle_path, &output_dir)).await?
+    extract_staged(bundle_path.to_path_buf(), output_dir.to_path_buf(), false).await
+}
+
+/// Take ownership of a received archive, removing it even if extraction is canceled.
+pub async fn extract_bundle_owned(bundle_path: PathBuf, output_dir: &Path) -> Result<u64> {
+    extract_staged(bundle_path, output_dir.to_path_buf(), true).await
+}
+
+async fn extract_staged(
+    bundle_path: PathBuf,
+    output_dir: PathBuf,
+    owns_archive: bool,
+) -> Result<u64> {
+    let canceled = Arc::new(AtomicBool::new(false));
+    let _cancel = CancelOnDrop(canceled.clone());
+    let archive_cleanup = BundleCleanup(owns_archive.then(|| bundle_path.clone()));
+    let parent = output_dir
+        .parent()
+        .context("output directory has no parent")?
+        .to_path_buf();
+    let extracted = tokio::task::spawn_blocking(move || -> Result<ExtractedBundle> {
+        // This guard outlives the archive's file handle, including on Windows.
+        let _archive_cleanup = archive_cleanup;
+        std::fs::create_dir_all(&parent)?;
+        let directory = parent.join(unique_temp_name(".p2pshare-extract"));
+        std::fs::create_dir(&directory)?;
+        let mut extracted = ExtractedBundle {
+            directory,
+            item_count: 0,
+        };
+        extracted.item_count =
+            extract_bundle_cancellable(&bundle_path, &extracted.directory, &canceled)?;
+        Ok(extracted)
+    })
+    .await??;
+    if output_dir.exists() {
+        bail!("output directory already exists: {}", output_dir.display());
+    }
+    // Publish only after the worker has finished. No await between rename and return.
+    std::fs::rename(&extracted.directory, &output_dir)?;
+    Ok(extracted.item_count)
 }
 
 pub fn logical_name_from_wire_name(name: &str) -> String {
@@ -34,7 +132,12 @@ pub fn logical_name_from_wire_name(name: &str) -> String {
         .to_string()
 }
 
+#[cfg(test)]
 fn create_bundle_blocking(paths: &[PathBuf]) -> Result<BundleBuild> {
+    create_bundle_cancellable(paths, &AtomicBool::new(false))
+}
+
+fn create_bundle_cancellable(paths: &[PathBuf], canceled: &AtomicBool) -> Result<BundleBuild> {
     if paths.is_empty() {
         bail!("at least one file is required");
     }
@@ -45,10 +148,17 @@ fn create_bundle_blocking(paths: &[PathBuf]) -> Result<BundleBuild> {
 
     let file = File::create(&bundle_path)
         .with_context(|| format!("failed to create bundle file {}", bundle_path.display()))?;
-    let mut builder = Builder::new(file);
+    let cleanup = BundleCleanup(Some(bundle_path.clone()));
+    let mut builder = Builder::new(HashingWriter {
+        file,
+        hasher: blake3::Hasher::new(),
+    });
     let mut used_names = HashSet::new();
 
     for path in paths {
+        if canceled.load(Ordering::Relaxed) {
+            bail!("bundle operation canceled");
+        }
         let metadata =
             std::fs::metadata(path).with_context(|| format!("cannot access {}", path.display()))?;
         if !metadata.is_file() {
@@ -62,8 +172,18 @@ fn create_bundle_blocking(paths: &[PathBuf]) -> Result<BundleBuild> {
             .to_string();
         let archive_name = dedupe_file_name(&base_name, &mut used_names);
 
+        let file = File::open(path)?;
+        let mut header = tar::Header::new_gnu();
+        header.set_metadata(&metadata);
         builder
-            .append_path_with_name(path, &archive_name)
+            .append_data(
+                &mut header,
+                &archive_name,
+                CancellableReader {
+                    inner: file,
+                    canceled,
+                },
+            )
             .with_context(|| format!("failed to add {} to bundle", path.display()))?;
     }
 
@@ -71,20 +191,57 @@ fn create_bundle_blocking(paths: &[PathBuf]) -> Result<BundleBuild> {
         .finish()
         .context("failed to finalize bundle archive")?;
 
+    let writer = builder
+        .into_inner()
+        .context("failed to close bundle archive")?;
+    let hash = writer.hasher.finalize().to_hex().to_string();
+
     Ok(BundleBuild {
+        cleanup,
+        hash,
         bundle_path,
         logical_name,
         item_count: paths.len() as u64,
     })
 }
 
+// Hash exactly the bytes written, including tar headers and final padding.
+struct HashingWriter {
+    file: File,
+    hasher: blake3::Hasher,
+}
+
+impl Write for HashingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.file.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+#[cfg(test)]
 fn extract_bundle_blocking(bundle_path: &Path, output_dir: &Path) -> Result<u64> {
+    extract_bundle_cancellable(bundle_path, output_dir, &AtomicBool::new(false))
+}
+
+fn extract_bundle_cancellable(
+    bundle_path: &Path,
+    output_dir: &Path,
+    canceled: &AtomicBool,
+) -> Result<u64> {
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
     let file = File::open(bundle_path)
         .with_context(|| format!("failed to open bundle {}", bundle_path.display()))?;
-    let mut archive = Archive::new(file);
+    let mut archive = Archive::new(CancellableReader {
+        inner: file,
+        canceled,
+    });
     let mut item_count = 0u64;
     let mut seen = HashSet::new();
 
@@ -209,6 +366,12 @@ mod tests {
         let build = create_bundle_blocking(&[source_dir.join("a.txt"), source_dir.join("b.txt")])
             .expect("create bundle");
 
+        assert_eq!(
+            build.hash,
+            blake3::hash(&fs::read(&build.bundle_path).expect("read archive"))
+                .to_hex()
+                .to_string()
+        );
         let count =
             extract_bundle_blocking(&build.bundle_path, &output_dir).expect("extract bundle");
         assert_eq!(count, 2);
@@ -223,6 +386,84 @@ mod tests {
 
         let _ = fs::remove_file(build.bundle_path);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn canceled_extraction_cleans_owned_archive_and_never_publishes() {
+        use std::future::Future;
+        use std::task::Poll;
+        let root = temp_test_dir("cancel-extraction");
+        let source = root.join("source.txt");
+        fs::write(&source, "payload").unwrap();
+        let archive = create_bundle_blocking(&[source]).unwrap().into_path();
+        let output = root.join("output");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (ready, started) = std::sync::mpsc::channel();
+        runtime.spawn_blocking(move || {
+            ready.send(()).unwrap();
+            blocked.recv().unwrap();
+        });
+        started.recv().unwrap();
+        runtime.block_on(async {
+            let mut extraction = Box::pin(super::extract_bundle_owned(archive.clone(), &output));
+            std::future::poll_fn(|context| {
+                assert!(extraction.as_mut().poll(context).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(extraction);
+        });
+        release.send(()).unwrap();
+        runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+        assert!(!archive.exists());
+        assert!(!output.exists());
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            1,
+            "only original source remains"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn owned_extraction_publishes_verified_contents_and_removes_archive() {
+        let root = temp_test_dir("owned-extraction");
+        let source = root.join("source.txt");
+        fs::write(&source, "payload").unwrap();
+        let archive = create_bundle_blocking(&[source]).unwrap().into_path();
+        let output = root.join("output");
+        assert_eq!(
+            super::extract_bundle_owned(archive.clone(), &output)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            fs::read_to_string(output.join("source.txt")).unwrap(),
+            "payload"
+        );
+        assert!(!archive.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_ownership_controls_cleanup() {
+        let root = temp_test_dir("bundle-ownership");
+        let source = root.join("source.txt");
+        fs::write(&source, "source").unwrap();
+        let bundle = create_bundle_blocking(std::slice::from_ref(&source)).unwrap();
+        let temporary = bundle.bundle_path.clone();
+        drop(bundle);
+        assert!(!temporary.exists());
+        let transferred = create_bundle_blocking(&[source]).unwrap().into_path();
+        assert!(transferred.exists());
+        fs::remove_file(transferred).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

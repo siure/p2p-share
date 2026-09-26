@@ -7,12 +7,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CRATE_DIR="$ROOT_DIR/crates/android-bindings"
-JNI_DIR="$ROOT_DIR/android/app/src/main/jniLibs"
+JNI_DIR="${1:-$ROOT_DIR/android/app/build/generated/rustJniLibs}"
 
-rm -rf "$JNI_DIR/arm64-v8a" "$JNI_DIR/armeabi-v7a" "$JNI_DIR/x86_64"
+mkdir -p "$JNI_DIR"
 
 pushd "$CRATE_DIR" >/dev/null
-cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o "$JNI_DIR" build --release
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o "$JNI_DIR" build --release --locked
 popd >/dev/null
 
 echo "Native libraries copied to $JNI_DIR"

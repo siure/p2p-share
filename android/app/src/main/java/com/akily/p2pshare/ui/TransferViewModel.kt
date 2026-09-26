@@ -20,6 +20,9 @@ import com.akily.p2pshare.model.TransferTab
 import com.akily.p2pshare.model.TransferUiState
 import com.akily.p2pshare.storage.FilePrep
 import com.akily.p2pshare.storage.PrefsStore
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -29,7 +32,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 
 class TransferViewModel(app: Application) : AndroidViewModel(app) {
-    private val engine: TransferEngine = TransferEngineFactory.create()
+    private val engine: TransferEngine = TransferEngineFactory.create(app)
     private val prefs = PrefsStore(app)
     private val readyStatus = "Ready"
 
@@ -51,7 +54,17 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
     var history by mutableStateOf<List<TransferHistoryEntry>>(emptyList())
         private set
 
+    var selectedFilesLabel by mutableStateOf("")
+        private set
+    var outputFolderLabel by mutableStateOf("Not selected")
+        private set
+    private var preparationJob: Job? = null
+    private val ownedPreparedFiles = mutableSetOf<File>()
+    private var activeSendPaths = emptySet<String>()
     private var pollJob: Job? = null
+
+    init { refreshOutputFolderLabel(receiveForm.outputTreeUri) }
+
     private var activeDirection: String = "send"
     private var pollGeneration: Long = 0
 
@@ -82,49 +95,80 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
     fun setOutputTree(uri: Uri?) {
         receiveForm = receiveForm.copy(outputTreeUri = uri)
         prefs.saveOutputTree(uri)
+        refreshOutputFolderLabel(uri)
     }
 
     fun prepareSendFiles(uris: List<Uri>) {
+        preparationJob?.cancel()
+        releaseUnusedPreparedFiles(emptySet())
+        sendForm = sendForm.copy(fileUris = uris, preparedPaths = emptyList())
+        selectedFilesLabel = if (uris.isEmpty()) "" else "${uris.size} selected"
         if (uris.isEmpty()) {
-            sendForm = sendForm.copy(fileUris = emptyList(), preparedPaths = emptyList())
             sendUi = sendUi.copy(stage = TransferStage.IDLE, statusLine = readyStatus, errorMessage = null)
             return
         }
-
-        sendForm = sendForm.copy(fileUris = uris, preparedPaths = emptyList())
-        val preparingLabel = if (uris.size == 1) "Preparing file..." else "Preparing files..."
-        sendUi = sendUi.copy(stage = TransferStage.PREPARING, statusLine = preparingLabel)
-
-        viewModelScope.launch {
-            runCatching {
+        sendUi = sendUi.copy(stage = TransferStage.PREPARING, statusLine = "Preparing files...")
+        preparationJob = viewModelScope.launch {
+            var copied: List<File>? = null
+            try {
+                val label = withContext(Dispatchers.IO) { describeFileUris(uris) }
+                if (sendForm.fileUris != uris) return@launch
+                selectedFilesLabel = label
                 withContext(Dispatchers.IO) {
-                    FilePrep.copyUrisToCacheFiles(getApplication(), uris)
+                    // Assign inside IO so cancellation on dispatch back still cleans up.
+                    copied = FilePrep.copyUrisToCacheFiles(getApplication(), uris)
                 }
-            }.onSuccess { files ->
-                if (sendForm.fileUris != uris) return@onSuccess
-                sendForm = sendForm.copy(
-                    fileUris = uris,
-                    preparedPaths = files.map(File::getAbsolutePath),
-                )
-                val preparedLabel = if (files.size == 1) {
-                    "File prepared: ${files.first().name}"
-                } else {
-                    "${files.size} files prepared"
+                if (sendForm.fileUris != uris) return@launch
+                val files = requireNotNull(copied)
+                ownedPreparedFiles.addAll(files)
+                copied = null
+                sendForm = sendForm.copy(preparedPaths = files.map(File::getAbsolutePath))
+                sendUi = sendUi.copy(stage = TransferStage.IDLE,
+                    statusLine = if (files.size == 1) "File prepared" else "${files.size} files prepared",
+                    errorMessage = null)
+            } catch (err: CancellationException) {
+                throw err
+            } catch (err: Exception) {
+                if (sendForm.fileUris == uris) {
+                    sendUi = sendUi.copy(stage = TransferStage.FAILED,
+                        statusLine = "Failed to prepare selected files.", errorMessage = err.message)
                 }
-                sendUi = sendUi.copy(
-                    stage = TransferStage.IDLE,
-                    statusLine = preparedLabel,
-                    errorMessage = null,
-                )
-            }.onFailure { err ->
-                if (sendForm.fileUris != uris) return@onFailure
-                sendForm = sendForm.copy(preparedPaths = emptyList())
-                sendUi = sendUi.copy(
-                    stage = TransferStage.FAILED,
-                    statusLine = "Failed to prepare selected files.",
-                    errorMessage = err.message,
-                )
+            } finally {
+                val unused = copied
+                if (unused != null) withContext(NonCancellable + Dispatchers.IO) {
+                    unused.forEach { runCatching { FilePrep.deletePreparedFile(getApplication(), it) } }
+                }
             }
+        }
+    }
+
+    private fun releaseUnusedPreparedFiles(keep: Set<String> = sendForm.preparedPaths.toSet()) {
+        val unused = ownedPreparedFiles.filter { it.absolutePath !in keep && it.absolutePath !in activeSendPaths }
+        ownedPreparedFiles.removeAll(unused.toSet())
+        val app = getApplication<Application>()
+        CoroutineScope(Dispatchers.IO).launch {
+            unused.forEach { runCatching { FilePrep.deletePreparedFile(app, it) } }
+        }
+    }
+
+    private fun finishSendOwnership() {
+        activeSendPaths = emptySet()
+        releaseUnusedPreparedFiles()
+    }
+
+    override fun onCleared() {
+        preparationJob?.cancel()
+        stopPolling()
+        engine.close()
+        activeSendPaths = emptySet()
+        releaseUnusedPreparedFiles(emptySet())
+        super.onCleared()
+    }
+
+    private fun refreshOutputFolderLabel(uri: Uri?) {
+        viewModelScope.launch {
+            val label = withContext(Dispatchers.IO) { describeUri(uri) }
+            if (receiveForm.outputTreeUri == uri) outputFolderLabel = label
         }
     }
 
@@ -140,18 +184,19 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
 
         val invalidPath = paths.firstOrNull { path ->
             val prepared = File(path)
-            !prepared.exists() || !prepared.isFile || prepared.length() == 0L
+            !prepared.exists() || !prepared.isFile
         }
         if (invalidPath != null) {
             sendUi = sendUi.copy(
                 stage = TransferStage.FAILED,
                 statusLine = "Selected files are unavailable.",
-                errorMessage = "One or more prepared files are missing or empty. Pick the files again.",
+                errorMessage = "One or more prepared files are unavailable. Pick the files again.",
             )
             sendForm = sendForm.copy(preparedPaths = emptyList())
             return
         }
 
+        activeSendPaths = paths.toSet()
         resetSendUi()
         activeDirection = "send"
         sendUi = sendUi.copy(stage = TransferStage.PREPARING, statusLine = "Starting send...")
@@ -183,7 +228,9 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun cancelTransfer() {
+        if (activeDirection == "send") preparationJob?.cancel()
         engine.cancel()
+        finishSendOwnership()
         stopPolling()
         updateActiveUi {
             it.copy(
@@ -234,16 +281,17 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
         pollGeneration += 1
         val generation = pollGeneration
         pollJob = viewModelScope.launch {
-            while (isActive) {
-                val event = engine.pollEvent()
-                if (event != null) {
-                    val shouldStop = applyEvent(event)
-                    if (shouldStop) {
+            var finished = false
+            while (isActive && !finished) {
+                // Bound each UI turn even when native events arrive continuously.
+                for (index in 0 until 32) {
+                    val event = engine.pollEvent() ?: break
+                    if (applyEvent(event)) {
+                        finished = true
                         break
                     }
-                } else {
-                    delay(80)
                 }
+                if (!finished) delay(16)
             }
             if (pollGeneration == generation) {
                 pollJob = null
@@ -306,9 +354,11 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             "completed" -> {
+                if (activeDirection == "send") finishSendOwnership()
                 var finalPath = event.savedPath
                 val outputTree = receiveForm.outputTreeUri
                 if (activeDirection == "receive" && finalPath != null && outputTree != null) {
+                    setCurrentUi(current.copy(statusLine = "Saving files..."))
                     finalPath = withContext(Dispatchers.IO) {
                         copyToOutputTree(finalPath, event.fileName ?: "received.bin", outputTree)
                     }
@@ -331,6 +381,7 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             "error" -> {
+                if (activeDirection == "send") finishSendOwnership()
                 setCurrentUi(
                     current.copy(
                         stage = TransferStage.FAILED,
@@ -350,6 +401,7 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
         val uri = runCatching {
             FilePrep.copyReceivedEntryToTree(getApplication(), sourcePath, tree, fileName)
         }.getOrNull()
+        if (uri != null) runCatching { FilePrep.deleteExportedStaging(getApplication(), sourcePath) }
         return uri?.toString() ?: sourcePath
     }
 

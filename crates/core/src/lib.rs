@@ -11,3 +11,6 @@ pub use events::{
     ConnectionPathKind, TransferCompleted, TransferContentKind, TransferEvent, TransferEventSink,
     TransferMode,
 };
+
+pub mod engine;
+pub use engine::{SharedSink, TransferEngine};

@@ -1,6 +1,6 @@
 {
   "name": "p2p-share-electron",
-  "version": "0.3.4",
+  "version": "0.4.0",
   "private": true,
   "author": "p2p-share contributors",
   "description": "Electron desktop GUI for p2p-share",
@@ -12,9 +12,12 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build:cli": "cargo build --release -p p2p-share",
     "test:packaged-binary": "node ./scripts/test-packaged-binary.js",
-    "dist": "npm run build && electron-builder --dir",
-    "dist:linux": "npm run build && electron-builder --linux",
-    "dist:win": "npm run build && electron-builder --win"
+    "dist": "npm run build:cli && npm run build && electron-builder --dir && npm run test:packaged-binary",
+    "dist:linux": "npm run build:cli && npm run build && electron-builder --linux && npm run test:packaged-binary",
+    "dist:win": "npm run build:cli && npm run build && electron-builder --win && npm run test:packaged-binary",
+    "test:worker": "tsc --target ES2022 --module commonjs --moduleResolution node --esModuleInterop --skipLibCheck --outDir out/tests src/main/worker-client.ts && node --test tests/worker-client.test.cjs",
+    "dist:linux:dir": "npm run build:cli && npm run build && electron-builder --linux --dir && npm run test:packaged-binary",
+    "start:linux:unpacked": "./dist/linux-unpacked/p2p-share-electron"
   },
   "dependencies": {
     "qrcode": "^1.5.4"
@@ -32,7 +35,9 @@
     "appId": "com.akily.p2pshare.desktop",
     "productName": "P2P Share",
     "files": [
-      "out/**/*"
+      "out/main/**/*",
+      "out/preload/**/*",
+      "out/renderer/**/*"
     ],
     "extraResources": [
       {
@@ -61,6 +66,13 @@
         "nsis",
         "zip"
       ]
+    }
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "npm",
+      "version": "12.1.0",
+      "onFail": "download"
     }
   }
 }

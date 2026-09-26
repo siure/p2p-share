@@ -5,33 +5,52 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 class NativeTransferController private constructor(
-    private val handle: Long,
+    private var handle: Long,
 ) : TransferEngine {
     override val usingRust: Boolean = true
 
+    @Synchronized
     override fun startSendWait(filePaths: List<String>) {
+        if (handle == 0L) return
         RustBindings.nativeStartSendWait(handle, JSONArray(filePaths).toString())
     }
 
+    @Synchronized
     override fun startSendToTicket(filePaths: List<String>, ticket: String) {
+        if (handle == 0L) return
         RustBindings.nativeStartSendToTicket(handle, JSONArray(filePaths).toString(), ticket)
     }
 
+    @Synchronized
     override fun startReceiveTarget(target: String, outputDir: String) {
+        if (handle == 0L) return
         RustBindings.nativeStartReceiveTarget(handle, target, outputDir)
     }
 
+    @Synchronized
     override fun startReceiveListen(outputDir: String) {
+        if (handle == 0L) return
         RustBindings.nativeStartReceiveListen(handle, outputDir)
     }
 
+    @Synchronized
     override fun pollEvent(): BridgeEvent? {
+        if (handle == 0L) return null
         val payload = RustBindings.nativePollEvent(handle) ?: return null
         return payload.toBridgeEvent()
     }
 
+    @Synchronized
     override fun cancel() {
+        if (handle == 0L) return
         RustBindings.nativeCancel(handle)
+    }
+
+    @Synchronized
+    override fun close() {
+        val ownedHandle = handle
+        handle = 0L
+        if (ownedHandle != 0L) RustBindings.nativeDestroyController(ownedHandle)
     }
 
     private fun String.toBridgeEvent(): BridgeEvent {
@@ -57,8 +76,8 @@ class NativeTransferController private constructor(
     companion object {
         private const val TAG = "P2PShareNative"
 
-        fun createOrNull(): NativeTransferController? {
-            if (!RustBindings.loaded) {
+        fun createOrNull(context: android.content.Context): NativeTransferController? {
+            if (!RustBindings.initialize(context)) {
                 Log.w(TAG, "Native library load failed: ${RustBindings.loadError}")
                 return null
             }

@@ -7,6 +7,7 @@ import android.provider.OpenableColumns
 import androidx.documentfile.provider.DocumentFile
 import java.io.File
 import java.io.IOException
+import java.util.UUID
 
 object FilePrep {
     fun copyUrisToCacheFiles(context: Context, uris: List<Uri>): List<File> {
@@ -17,17 +18,19 @@ object FilePrep {
             }
             return copied
         } catch (err: Throwable) {
-            copied.forEach(File::delete)
+            copied.forEach { deletePreparedFile(context, it) }
             throw err
         }
     }
 
     fun copyUriToCacheFile(context: Context, uri: Uri): File {
         val resolver = context.contentResolver
-        val fallbackName = DocumentFile.fromSingleUri(context, uri)?.name ?: "shared-file.bin"
         val sourceMeta = resolver.queryOpenableMeta(uri)
-        val name = sourceMeta?.displayName?.takeIf { it.isNotBlank() } ?: fallbackName
-        val target = File(context.cacheDir, "send-${System.currentTimeMillis()}-$name")
+        val name = sourceMeta?.displayName?.takeIf { it.isNotBlank() }
+            ?: DocumentFile.fromSingleUri(context, uri)?.name ?: "shared-file.bin"
+        val directory = File(context.cacheDir, "p2pshare-send-${UUID.randomUUID()}")
+        check(directory.mkdirs()) { "Unable to create preparation directory" }
+        val target = File(directory, File(name).name.takeIf { it.isNotBlank() && it != "." && it != ".." } ?: "shared-file.bin")
         try {
             val copied = resolver.openInputStream(uri).use { input ->
                 requireNotNull(input) { "Unable to read selected file" }
@@ -48,8 +51,24 @@ object FilePrep {
 
             return target
         } catch (err: Throwable) {
-            target.delete()
+            deletePreparedFile(context, target)
             throw err
+        }
+    }
+
+    fun deletePreparedFile(context: Context, file: File) {
+        val parent = file.parentFile ?: return
+        if (parent.parentFile?.canonicalFile != context.cacheDir.canonicalFile ||
+            !parent.name.startsWith("p2pshare-send-")) return
+        file.delete()
+        parent.delete()
+    }
+
+    fun deleteExportedStaging(context: Context, sourcePath: String) {
+        val source = File(sourcePath).canonicalFile
+        val incoming = File(context.filesDir, "incoming").canonicalFile
+        if (source.toPath().startsWith(incoming.toPath()) && source != incoming) {
+            source.deleteRecursively()
         }
     }
 
@@ -61,9 +80,10 @@ object FilePrep {
     ): Uri? {
         val root = DocumentFile.fromTreeUri(context, outputTree) ?: return null
         val source = File(sourcePath)
+        val usedNames = root.listFiles().mapNotNull { it.name }.toMutableSet()
         return when {
-            source.isDirectory -> copyDirectoryToTree(context, source, root, requestedName)?.uri
-            source.isFile -> copyFileToTree(context, source, root, requestedName)?.uri
+            source.isDirectory -> copyDirectoryToTree(context, source, root, requestedName, usedNames)?.uri
+            source.isFile -> copyFileToTree(context, source, root, requestedName, usedNames)?.uri
             else -> null
         }
     }
@@ -73,14 +93,16 @@ object FilePrep {
         sourceDir: File,
         root: DocumentFile,
         requestedName: String,
+        usedNames: MutableSet<String>,
     ): DocumentFile? {
-        val outDir = createUniqueDirectory(root, requestedName) ?: return null
+        val outDir = createUniqueDirectory(root, requestedName, usedNames) ?: return null
+        val childNames = mutableSetOf<String>()
         val children = sourceDir.listFiles().orEmpty().sortedBy { it.name.lowercase() }
         for (child in children) {
             val copied = if (child.isDirectory) {
-                copyDirectoryToTree(context, child, outDir, child.name)
+                copyDirectoryToTree(context, child, outDir, child.name, childNames)
             } else if (child.isFile) {
-                copyFileToTree(context, child, outDir, child.name)
+                copyFileToTree(context, child, outDir, child.name, childNames)
             } else {
                 continue
             }
@@ -96,8 +118,9 @@ object FilePrep {
         source: File,
         root: DocumentFile,
         requestedName: String,
+        usedNames: MutableSet<String>,
     ): DocumentFile? {
-        val candidateName = uniqueChildName(root, requestedName)
+        val candidateName = uniqueChildName(usedNames, requestedName)
         val mime = contentResolverMime(context.contentResolver, requestedName)
         val outDoc = root.createFile(mime, candidateName) ?: return null
 
@@ -110,15 +133,15 @@ object FilePrep {
         return outDoc
     }
 
-    private fun createUniqueDirectory(root: DocumentFile, requestedName: String): DocumentFile? {
-        val candidateName = uniqueChildName(root, requestedName)
+    private fun createUniqueDirectory(root: DocumentFile, requestedName: String, usedNames: MutableSet<String>): DocumentFile? {
+        val candidateName = uniqueChildName(usedNames, requestedName)
         return root.createDirectory(candidateName)
     }
 
-    private fun uniqueChildName(root: DocumentFile, requestedName: String): String {
+    private fun uniqueChildName(usedNames: MutableSet<String>, requestedName: String): String {
         var candidateName = requestedName
         var index = 1
-        while (root.findFile(candidateName) != null) {
+        while (!usedNames.add(candidateName)) {
             candidateName = withSuffixIndex(requestedName, index)
             index += 1
         }

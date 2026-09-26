@@ -1,10 +1,11 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu } from "electron";
-import { spawn, spawnSync, type ChildProcessByStdio } from "node:child_process";
+import { spawn, execFile, type ChildProcessByStdio } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import type { Readable } from "node:stream";
-import QRCode from "qrcode";
+import { promisify } from "node:util";
+import { WorkerClient, type WorkerTransfer } from "./worker-client";
 
 import type { BuildInfo, StartTransferPayload, TransferEvent, TransferMode } from "../shared/ipc";
 import { evaluateSchemaCompatibility, TRANSFER_EVENT_SCHEMA_VERSION } from "../shared/schema";
@@ -26,6 +27,12 @@ interface ResolvedCliCommand {
 }
 
 let activeTransfer: ActiveTransfer | null = null;
+let worker: WorkerClient | null = null;
+let startingTransfer = false;
+let cancelPendingStart = false;
+let quitting = false;
+let cachedBuildInfo: Promise<BuildInfo> | null = null;
+const execFileAsync = promisify(execFile);
 
 function cliBinaryName(): string {
   return process.platform === "win32" ? "p2p-share.exe" : "p2p-share";
@@ -274,103 +281,108 @@ function objectStringField(obj: Record<string, unknown>, ...keys: string[]): str
   return null;
 }
 
-function probeCliVersion(cli: ResolvedCliCommand): {
+async function probeCliVersion(cli: ResolvedCliCommand): Promise<{
   version: string | null;
   schemaVersion: string | null;
+  capabilities: string[];
   error: string | null;
-} {
-  const argsCandidates = [
-    [...cli.argsPrefix, "version", "--json"],
-    [...cli.argsPrefix, "--version", "--json"],
-    [...cli.argsPrefix, "--version"]
-  ];
-
-  let lastError = "";
-
-  for (const args of argsCandidates) {
-    const result = spawnSync(cli.command, args, {
+}> {
+  try {
+    const { stdout } = await execFileAsync(cli.command, [...cli.argsPrefix, "version", "--json"], {
       cwd: repoRoot(),
       encoding: "utf8",
-      timeout: 8000
+      timeout: 8000,
+      maxBuffer: 64 * 1024,
+      windowsHide: true
     });
-
-    if (result.error) {
-      lastError = result.error.message;
-      continue;
-    }
-
-    const stdout = typeof result.stdout === "string" ? result.stdout : "";
-    const stderr = typeof result.stderr === "string" ? result.stderr : "";
-    const firstLine = firstNonEmptyLine(stdout) || firstNonEmptyLine(stderr);
-    const parsedJson = maybeParseJsonObject(firstLine);
-
-    const versionFromJson = parsedJson
-      ? objectStringField(parsedJson, "version", "cli_version", "app_version")
-      : null;
-    const schemaFromJson = parsedJson
-      ? objectStringField(
-          parsedJson,
-          "schema_version",
-          "event_schema_version",
-          "transfer_event_schema_version"
-        )
-      : null;
-
-    const version = versionFromJson ?? extractSemver(firstLine);
-    if (version || schemaFromJson) {
-      return {
-        version: version ?? null,
-        schemaVersion: schemaFromJson ?? null,
-        error: null
-      };
-    }
-
-    if (result.status === 0) {
-      return {
-        version: null,
-        schemaVersion: null,
-        error: "CLI version command succeeded but no parseable version payload was returned."
-      };
-    }
-
-    lastError = firstLine || `Version command exited with code ${result.status ?? 1}.`;
+    const firstLine = firstNonEmptyLine(stdout);
+    const parsed = maybeParseJsonObject(firstLine);
+    const version = parsed ? objectStringField(parsed, "version", "cli_version", "app_version") : extractSemver(firstLine);
+    const schemaVersion = parsed ? objectStringField(parsed, "schema_version", "event_schema_version") : null;
+    return {
+      version,
+      schemaVersion,
+      capabilities: parsed ? stringArray(parsed.capabilities) : [],
+      error: version || schemaVersion ? null : "CLI did not return version information."
+    };
+  } catch (error) {
+    return {
+      version: null,
+      schemaVersion: null,
+      capabilities: [],
+      error: error instanceof Error ? error.message : String(error)
+    };
   }
+}
 
+function getBuildInfo(): Promise<BuildInfo> {
+  cachedBuildInfo ??= (async () => {
+    const cli = resolveCliCommand();
+    const exists = commandExists(cli.command);
+    const probe = exists
+      ? await probeCliVersion(cli)
+      : { version: null, schemaVersion: null, capabilities: [], error: `CLI command not found: ${cli.command}` };
+    return {
+      appVersion: app.getVersion(),
+      expectedSchemaVersion: TRANSFER_EVENT_SCHEMA_VERSION,
+      cli: {
+        command: cli.command,
+        source: cli.source,
+        exists,
+        ...probe,
+        compatibility: evaluateSchemaCompatibility(TRANSFER_EVENT_SCHEMA_VERSION, probe.schemaVersion)
+      }
+    };
+  })();
+  return cachedBuildInfo;
+}
+
+async function prepareWorker(): Promise<WorkerClient | null> {
+  const info = await getBuildInfo();
+  if (quitting || !info.cli.capabilities.includes("worker")) return null;
+  if (!worker) {
+    const cli = resolveCliCommand();
+    worker = new WorkerClient({ ...cli, cwd: repoRoot(), onEvent: emitTransferEvent });
+  }
+  worker.warmup();
+  return worker;
+}
+
+function workerTransfer(payload: StartTransferPayload): WorkerTransfer {
+  if (payload.mode === "send_wait" || payload.mode === "send_to_ticket") {
+    return {
+      command: "send",
+      files: stringArray(payload.filePaths),
+      ...(payload.mode === "send_to_ticket" ? { to: trimOrEmpty(payload.ticket) } : {})
+    };
+  }
   return {
-    version: null,
-    schemaVersion: null,
-    error: lastError || "Failed to query CLI version."
+    command: "receive",
+    output: trimOrEmpty(payload.outputDir),
+    ...(payload.mode === "receive_target" ? { target: trimOrEmpty(payload.target) } : {})
   };
 }
 
-function getBuildInfo(): BuildInfo {
-  const cli = resolveCliCommand();
-  const exists = commandExists(cli.command);
-  const versionProbe = exists
-    ? probeCliVersion(cli)
-    : {
-        version: null,
-        schemaVersion: null,
-        error: `CLI command not found: ${cli.command}`
-      };
-  const compatibility = evaluateSchemaCompatibility(
-    TRANSFER_EVENT_SCHEMA_VERSION,
-    versionProbe.schemaVersion
-  );
-
-  return {
-    appVersion: app.getVersion(),
-    expectedSchemaVersion: TRANSFER_EVENT_SCHEMA_VERSION,
-    cli: {
-      command: cli.command,
-      source: cli.source,
-      exists,
-      version: versionProbe.version,
-      schemaVersion: versionProbe.schemaVersion,
-      compatibility,
-      error: versionProbe.error
+async function startTransfer(payload: StartTransferPayload): Promise<void> {
+  if (quitting) throw new Error("App is shutting down.");
+  if (startingTransfer || worker?.busy || activeTransfer) throw new Error("A transfer is already running.");
+  buildTransferArgs(payload);
+  startingTransfer = true;
+  cancelPendingStart = false;
+  try {
+    const engine = await prepareWorker();
+    if (cancelPendingStart || quitting) {
+      emitTransferEvent({ kind: "process_end", value: "canceled", schema_version: TRANSFER_EVENT_SCHEMA_VERSION });
+      return;
     }
-  };
+    if (engine) {
+      engine.start(workerTransfer(payload));
+    } else {
+      startLegacyTransfer(payload);
+    }
+  } finally {
+    startingTransfer = false;
+  }
 }
 
 function buildTransferArgs(payload: StartTransferPayload): string[] {
@@ -430,7 +442,7 @@ function emitStatus(message: string, value: string): void {
   });
 }
 
-function startTransfer(payload: StartTransferPayload): void {
+function startLegacyTransfer(payload: StartTransferPayload): void {
   if (activeTransfer?.child && activeTransfer.child.exitCode === null) {
     throw new Error("A transfer is already running.");
   }
@@ -506,13 +518,13 @@ function startTransfer(payload: StartTransferPayload): void {
   });
 
   child.on("error", (err: Error) => {
+    sawStructuredError = true;
     emitTransferEvent({
       kind: "error",
       message: `Failed to start transfer process: ${err.message}`,
       value: "spawn_error",
       schema_version: TRANSFER_EVENT_SCHEMA_VERSION
     });
-    cleanupTransfer();
   });
 
   child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
@@ -543,6 +555,11 @@ function startTransfer(payload: StartTransferPayload): void {
 }
 
 function cancelTransfer(): boolean {
+  if (startingTransfer) {
+    cancelPendingStart = true;
+    return true;
+  }
+  if (worker?.busy) return worker.cancel();
   if (!activeTransfer?.child || activeTransfer.child.exitCode !== null) {
     return false;
   }
@@ -576,6 +593,10 @@ function createWindow(): void {
       webSecurity: true,
       preload: path.join(__dirname, "../preload/index.js")
     }
+  });
+
+  mainWindow.webContents.once("did-finish-load", () => {
+    void prepareWorker().catch((error) => console.error("Transfer engine warmup failed:", error));
   });
 
   const devServerUrl = process.env.ELECTRON_RENDERER_URL || process.env.VITE_DEV_SERVER_URL;
@@ -630,6 +651,7 @@ ipcMain.handle("qr:create-data-url", async (_event, text: unknown) => {
   if (!payload) {
     return null;
   }
+  const { default: QRCode } = await import("qrcode");
   return QRCode.toDataURL(payload, {
     margin: 1,
     width: 320,
@@ -673,7 +695,7 @@ ipcMain.handle("clipboard:write", async (_event, text: unknown) => {
 });
 
 ipcMain.handle("transfer:start", async (_event, payload: unknown) => {
-  startTransfer(parseTransferPayload(payload));
+  await startTransfer(parseTransferPayload(payload));
   return { ok: true };
 });
 
@@ -696,4 +718,17 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
   }
+});
+
+app.on("before-quit", (event) => {
+  if (quitting) return;
+  event.preventDefault();
+  quitting = true;
+  cancelTransfer();
+  const legacy = activeTransfer?.child;
+  const stopLegacy = legacy ? new Promise<void>((resolve) => {
+    const timer = setTimeout(() => legacy.kill("SIGKILL"), 5000);
+    legacy.once("close", () => { clearTimeout(timer); resolve(); });
+  }) : Promise.resolve();
+  void Promise.all([worker?.shutdown(), stopLegacy]).finally(() => app.quit());
 });

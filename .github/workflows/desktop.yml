@@ -77,6 +77,10 @@ jobs:
         working-directory: electron
         run: npm run typecheck
 
+      - name: Test desktop worker lifecycle
+        working-directory: electron
+        run: npm run test:worker
+
       - name: Build Electron desktop bundle
         working-directory: electron
         run: npm run ${{ matrix.dist_script }}

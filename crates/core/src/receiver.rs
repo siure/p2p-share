@@ -1,44 +1,23 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-
 use anyhow::{bail, Context, Result};
-use iroh::endpoint::ConnectionType;
-use iroh::{Endpoint, NodeId, Watcher as _};
-use n0_future::StreamExt;
-use tokio::fs::File;
+use iroh::{
+    endpoint::{Connection, ConnectionError, SendStream, StoppedError, VarInt},
+    Endpoint,
+};
+use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
 use crate::bundle;
 use crate::crypto;
-use crate::events::{
-    ConnectionPathKind, TransferCompleted, TransferContentKind, TransferEvent, TransferEventSink,
-};
+use crate::events::{TransferCompleted, TransferContentKind, TransferEvent};
 use crate::progress::transfer_progress_bar;
 use crate::protocol::{human_bytes, FileHeader};
 use crate::ticket;
 
-/// ALPN protocol identifier — must match the sender.
-const ALPN: &[u8] = b"p2p-share/1";
+use crate::engine::{
+    self, bounded, emit, status, PartialFile, Session, SharedSink, TransferEngine, ALPN,
+    ALPN_REVERSE,
+};
 
-/// ALPN for reverse mode — the connector is the file sender.
-const ALPN_REVERSE: &[u8] = b"p2p-share/1-reverse";
-
-type SharedSink = Arc<dyn TransferEventSink>;
-
-fn emit(sink: Option<&SharedSink>, event: TransferEvent) {
-    if let Some(sink) = sink {
-        sink.on_event(event);
-    }
-}
-
-fn status(sink: Option<&SharedSink>, msg: impl Into<String>) {
-    let msg = msg.into();
-    eprintln!("{}", msg);
-    emit(sink, TransferEvent::Status(msg));
-}
-
-/// Pick a destination path that doesn't collide with existing files.
 fn unique_path(dir: &Path, name: &str) -> PathBuf {
     let candidate = dir.join(name);
     if !candidate.exists() {
@@ -65,106 +44,6 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
     unreachable!()
 }
 
-/// Spawn a background task that watches connection type changes and prints/emits them.
-fn spawn_conn_type_watcher(
-    ep: &Endpoint,
-    node_id: NodeId,
-    sink: Option<SharedSink>,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let watcher = ep.conn_type(node_id)?;
-    let mut stream = watcher.stream_updates_only();
-    let handle = tokio::task::spawn(async move {
-        while let Some(conn_type) = stream.next().await {
-            match &conn_type {
-                ConnectionType::Direct(addr) => {
-                    eprintln!("Connection upgraded: direct ({})", addr);
-                    emit(
-                        sink.as_ref(),
-                        TransferEvent::ConnectionPath {
-                            kind: ConnectionPathKind::Direct(addr.to_string()),
-                            latency_ms: None,
-                        },
-                    );
-                }
-                ConnectionType::Relay(url) => {
-                    eprintln!("Connection changed: relay ({})", url);
-                    emit(
-                        sink.as_ref(),
-                        TransferEvent::ConnectionPath {
-                            kind: ConnectionPathKind::Relay(url.to_string()),
-                            latency_ms: None,
-                        },
-                    );
-                }
-                ConnectionType::Mixed(addr, url) => {
-                    eprintln!("Connection changed: mixed (udp: {}, relay: {})", addr, url);
-                    emit(
-                        sink.as_ref(),
-                        TransferEvent::ConnectionPath {
-                            kind: ConnectionPathKind::Mixed {
-                                udp_addr: addr.to_string(),
-                                relay_url: url.to_string(),
-                            },
-                            latency_ms: None,
-                        },
-                    );
-                }
-                ConnectionType::None => {
-                    eprintln!("Connection path: none (searching...)");
-                    emit(
-                        sink.as_ref(),
-                        TransferEvent::ConnectionPath {
-                            kind: ConnectionPathKind::None,
-                            latency_ms: None,
-                        },
-                    );
-                }
-            }
-        }
-    });
-    Some(handle)
-}
-
-/// Print a summary of the final connection state.
-fn print_conn_summary(ep: &Endpoint, node_id: NodeId, sink: Option<&SharedSink>) {
-    if let Some(info) = ep.remote_info(node_id) {
-        let latency = info.latency.map(|d| d.as_secs_f64() * 1000.0);
-        let latency_str = latency
-            .map(|d| format!("{:.1}ms", d))
-            .unwrap_or_else(|| "unknown".to_string());
-        eprintln!(
-            "Transfer path: {}, latency: {}",
-            info.conn_type, latency_str
-        );
-
-        let kind = match info.conn_type {
-            ConnectionType::Direct(addr) => ConnectionPathKind::Direct(addr.to_string()),
-            ConnectionType::Relay(url) => ConnectionPathKind::Relay(url.to_string()),
-            ConnectionType::Mixed(addr, url) => ConnectionPathKind::Mixed {
-                udp_addr: addr.to_string(),
-                relay_url: url.to_string(),
-            },
-            ConnectionType::None => ConnectionPathKind::None,
-        };
-        emit(
-            sink,
-            TransferEvent::ConnectionPath {
-                kind,
-                latency_ms: latency,
-            },
-        );
-    }
-}
-
-/// Print a QR code to stderr, indented for readability.
-fn print_qr(data: &str) {
-    if let Ok(qr_string) = qr2term::generate_qr_string(data) {
-        for line in qr_string.lines() {
-            eprintln!("    {}", line);
-        }
-    }
-}
-
 fn bundle_logical_name(header: &FileHeader) -> String {
     header
         .logical_name
@@ -175,217 +54,107 @@ fn bundle_logical_name(header: &FileHeader) -> String {
         .unwrap_or_else(|| bundle::logical_name_from_wire_name(&header.name))
 }
 
-/// Run the receive side: connect to the sender (via iroh ticket or ip:port),
-/// perform the Noise handshake, receive the encrypted file, and verify the checksum.
+/// One-shot helpers; desktop/mobile callers should keep a TransferEngine.
 pub async fn run(target: &str, output_dir: &Path) -> Result<()> {
     run_with_sink(target, output_dir, None).await
 }
-
 pub async fn run_with_sink(
     target: &str,
     output_dir: &Path,
     sink: Option<SharedSink>,
 ) -> Result<()> {
-    let target = target.trim();
-    if ticket::is_ticket(target) {
-        run_iroh(target, output_dir, sink).await
-    } else {
-        run_direct_tcp(target, output_dir, sink).await
+    if !ticket::is_ticket(target) {
+        return run_direct_tcp(target.trim(), output_dir, sink).await;
     }
+    let engine = TransferEngine::bind().await?;
+    let result = engine.receive(Some(target), output_dir, sink).await;
+    engine.close().await;
+    result
+}
+pub async fn run_listen(output_dir: &Path) -> Result<()> {
+    run_listen_with_sink(output_dir, None).await
+}
+pub async fn run_listen_with_sink(output_dir: &Path, sink: Option<SharedSink>) -> Result<()> {
+    let engine = TransferEngine::bind().await?;
+    let result = engine.receive(None, output_dir, sink).await;
+    engine.close().await;
+    result
 }
 
-/// Connect to the sender via an iroh ticket (NAT-traversal, hole-punching, relay).
-async fn run_iroh(target: &str, output_dir: &Path, sink: Option<SharedSink>) -> Result<()> {
-    let addr = ticket::deserialize(target)?;
-
-    status(sink.as_ref(), "Connecting to sender via iroh...");
-
-    let ep = Endpoint::builder()
-        .bind()
-        .await
-        .context("failed to create iroh endpoint")?;
-
-    let conn = ep
-        .connect(addr, ALPN)
-        .await
-        .context("failed to connect to sender")?;
-
-    let remote_node_id = conn.remote_node_id()?;
-    status(sink.as_ref(), "Connected to sender.");
-
-    if let Some(info) = ep.remote_info(remote_node_id) {
-        eprintln!("Connection path: {}", info.conn_type);
+pub(crate) async fn receive_on_endpoint(
+    ep: &Endpoint,
+    target: Option<&str>,
+    output_dir: &Path,
+    sink: Option<SharedSink>,
+) -> Result<()> {
+    let target = target.map(str::trim);
+    if let Some(target) = target.filter(|t| !ticket::is_ticket(t)) {
+        return run_direct_tcp(target, output_dir, sink).await;
     }
-    let watcher_handle = spawn_conn_type_watcher(&ep, remote_node_id, sink.clone());
-
-    let (mut send_stream, mut recv_stream) = conn
-        .open_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to open bi stream: {}", e))?;
-
-    let (mut transport, code) =
-        crypto::handshake_initiator(&mut recv_stream, &mut send_stream).await?;
+    let conn = if let Some(target) = target {
+        status(sink.as_ref(), "Connecting to sender...");
+        let (addr, session_alpn) = ticket::connection_target(target, ALPN)?;
+        bounded("connecting to sender", ep.connect(addr, &session_alpn)).await?
+    } else {
+        engine::accept_with_tickets(ep, ALPN_REVERSE, sink.as_ref()).await?
+    };
+    let mut session = Session::new(conn, sink.clone());
+    let conn = &session.conn;
+    status(sink.as_ref(), "Sender connected.");
+    let (mut send_stream, mut recv_stream) = if target.is_some() {
+        bounded("opening transfer stream", conn.open_bi()).await?
+    } else {
+        bounded("waiting for transfer stream", conn.accept_bi()).await?
+    };
+    let handshake = async {
+        if target.is_some() {
+            crypto::handshake_initiator(&mut recv_stream, &mut send_stream).await
+        } else {
+            crypto::handshake_responder(&mut recv_stream, &mut send_stream).await
+        }
+    };
+    let (mut transport, code) = bounded("establishing encryption", handshake).await?;
     status(
         sink.as_ref(),
-        format!("Encryption established. Verification code: {}", code),
+        format!("Encryption established. Verification code: {code}"),
     );
     emit(sink.as_ref(), TransferEvent::HandshakeCode(code));
-
-    receive_file(
+    let completed = receive_file(
         &mut recv_stream,
         &mut send_stream,
         &mut transport,
         output_dir,
         sink.as_ref(),
+        false,
     )
     .await?;
-
-    if let Some(handle) = watcher_handle {
-        handle.abort();
-    }
-    print_conn_summary(&ep, remote_node_id, sink.as_ref());
-
-    conn.close(0u8.into(), b"done");
-    ep.close().await;
-
+    confirm_done_delivery(conn, &mut send_stream).await?;
+    session.complete();
+    emit(sink.as_ref(), TransferEvent::Completed(completed));
     Ok(())
 }
 
-/// Connect to the sender via direct TCP (for LAN use when the ip:port is reachable).
 async fn run_direct_tcp(addr: &str, output_dir: &Path, sink: Option<SharedSink>) -> Result<()> {
-    if addr.contains("p2psh") {
-        bail!(
-            "This looks like an iroh ticket, not an ip:port address.\n\
-             Make sure you are running the latest build of p2p-share on this device."
-        );
-    }
-
-    status(sink.as_ref(), format!("Connecting to {}...", addr));
-
-    let stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .with_context(|| format!("failed to connect to {}", addr))?;
-
-    status(sink.as_ref(), "Connected to sender.");
-
+    status(sink.as_ref(), format!("Connecting to {addr}..."));
+    let stream = bounded("connecting to sender", tokio::net::TcpStream::connect(addr)).await?;
+    stream.set_nodelay(true)?;
     let (mut reader, mut writer) = stream.into_split();
-
-    let (mut transport, code) = crypto::handshake_initiator(&mut reader, &mut writer).await?;
-    status(
-        sink.as_ref(),
-        format!("Encryption established. Verification code: {}", code),
-    );
+    let (mut transport, code) = bounded(
+        "establishing encryption",
+        crypto::handshake_initiator(&mut reader, &mut writer),
+    )
+    .await?;
     emit(sink.as_ref(), TransferEvent::HandshakeCode(code));
-
-    receive_file(
+    let completed = receive_file(
         &mut reader,
         &mut writer,
         &mut transport,
         output_dir,
         sink.as_ref(),
+        true,
     )
     .await?;
-
-    Ok(())
-}
-
-/// Run the receive side in listen mode: create an iroh endpoint, display a
-/// QR code / ticket, and wait for a sender to connect with `--to`.
-pub async fn run_listen(output_dir: &Path) -> Result<()> {
-    run_listen_with_sink(output_dir, None).await
-}
-
-pub async fn run_listen_with_sink(output_dir: &Path, sink: Option<SharedSink>) -> Result<()> {
-    status(sink.as_ref(), "Setting up secure connection...");
-
-    let ep = Endpoint::builder()
-        .alpns(vec![ALPN.to_vec(), ALPN_REVERSE.to_vec()])
-        .bind()
-        .await
-        .context("failed to create iroh endpoint")?;
-
-    status(sink.as_ref(), "Connecting to relay...");
-    let relay_timeout =
-        tokio::time::timeout(Duration::from_secs(10), ep.home_relay().initialized()).await;
-
-    match &relay_timeout {
-        Ok(relay_url) => {
-            status(sink.as_ref(), format!("Relay connected: {}", relay_url));
-        }
-        Err(_) => {
-            status(
-                sink.as_ref(),
-                "Warning: could not connect to relay (timed out).",
-            );
-            status(sink.as_ref(), "Only direct/LAN connections will work.");
-        }
-    }
-
-    let node_addr = ep.node_addr().initialized().await;
-    let ticket_str = ticket::serialize(&node_addr)?;
-    emit(sink.as_ref(), TransferEvent::Ticket(ticket_str.clone()));
-    emit(sink.as_ref(), TransferEvent::QrPayload(ticket_str.clone()));
-
-    eprintln!();
-    eprintln!("Ready to receive files.");
-    eprintln!();
-    eprintln!("  Scan this QR code on the sending device:");
-    eprintln!();
-    print_qr(&ticket_str);
-    eprintln!();
-    eprintln!(
-        "  Or run:\n\n    p2p-share send --to {} <FILE>...",
-        ticket_str
-    );
-    eprintln!();
-    status(sink.as_ref(), "Waiting for sender to connect...");
-
-    let incoming = ep.accept().await.context("no incoming connection")?;
-
-    let conn = incoming
-        .accept()
-        .map_err(|e| anyhow::anyhow!("failed to accept connection: {}", e))?
-        .await
-        .map_err(|e| anyhow::anyhow!("connection failed: {}", e))?;
-
-    let remote_node_id = conn.remote_node_id()?;
-    status(sink.as_ref(), "Sender connected.");
-
-    if let Some(info) = ep.remote_info(remote_node_id) {
-        eprintln!("Connection path: {}", info.conn_type);
-    }
-    let watcher_handle = spawn_conn_type_watcher(&ep, remote_node_id, sink.clone());
-
-    let (mut send_stream, mut recv_stream) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to accept bi stream: {}", e))?;
-
-    let (mut transport, code) =
-        crypto::handshake_responder(&mut recv_stream, &mut send_stream).await?;
-    status(
-        sink.as_ref(),
-        format!("Encryption established. Verification code: {}", code),
-    );
-    emit(sink.as_ref(), TransferEvent::HandshakeCode(code));
-
-    receive_file(
-        &mut recv_stream,
-        &mut send_stream,
-        &mut transport,
-        output_dir,
-        sink.as_ref(),
-    )
-    .await?;
-
-    if let Some(handle) = watcher_handle {
-        handle.abort();
-    }
-    print_conn_summary(&ep, remote_node_id, sink.as_ref());
-
-    conn.close(0u8.into(), b"done");
-    ep.close().await;
-
+    emit(sink.as_ref(), TransferEvent::Completed(completed));
     Ok(())
 }
 
@@ -396,12 +165,17 @@ async fn receive_file<R, W>(
     transport: &mut snow::TransportState,
     output_dir: &Path,
     sink: Option<&SharedSink>,
-) -> Result<()>
+    legacy_tcp_ack: bool,
+) -> Result<TransferCompleted>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let header_bytes = crypto::encrypted_read(reader, transport).await?;
+    let header_bytes = bounded(
+        "waiting for file metadata",
+        crypto::encrypted_read(reader, transport),
+    )
+    .await?;
     let header_str = String::from_utf8(header_bytes).context("invalid UTF-8 in file header")?;
 
     if header_str.is_empty() {
@@ -434,10 +208,17 @@ where
     };
     status(sink, incoming_status);
 
-    crypto::encrypted_write(writer, transport, b"OK\n").await?;
+    if legacy_tcp_ack {
+        bounded(
+            "accepting legacy TCP transfer",
+            crypto::encrypted_write(writer, transport, b"OK\n"),
+        )
+        .await?;
+    }
 
     tokio::fs::create_dir_all(output_dir).await?;
     let temp_dest = unique_path(output_dir, &format!("{}.part", header.name));
+
     let final_dest = if content_kind == TransferContentKind::Bundle {
         unique_path(output_dir, &completed_name)
     } else {
@@ -454,17 +235,29 @@ where
     }
     eprintln!();
 
-    let mut file = File::create(&temp_dest).await?;
+    let (mut file, mut partial) = PartialFile::create(temp_dest.clone()).await?;
     let pb = if sink.is_none() {
         Some(transfer_progress_bar(header.size))
     } else {
         None
     };
     let mut received: u64 = 0;
+    let mut ciphertext = Vec::with_capacity(crate::protocol::CHUNK_SIZE + 16);
+    let mut plaintext = Vec::with_capacity(crate::protocol::CHUNK_SIZE);
+    let mut progress = crate::progress::ProgressThrottle::default();
     let mut hasher = blake3::Hasher::new();
     let receive_result: Result<(PathBuf, u64)> = async {
         while received < header.size {
-            let plaintext = crypto::encrypted_read(reader, transport).await?;
+            bounded(
+                "receiving file data",
+                crypto::encrypted_read_with_buffers(
+                    reader,
+                    transport,
+                    &mut ciphertext,
+                    &mut plaintext,
+                ),
+            )
+            .await?;
             if plaintext.is_empty() {
                 break;
             }
@@ -475,13 +268,15 @@ where
             if let Some(pb) = &pb {
                 pb.set_position(received);
             }
-            emit(
-                sink,
-                TransferEvent::Progress {
-                    done: received,
-                    total: header.size,
-                },
-            );
+            if progress.should_emit(received, header.size) {
+                emit(
+                    sink,
+                    TransferEvent::Progress {
+                        done: received,
+                        total: header.size,
+                    },
+                );
+            }
         }
 
         file.flush().await?;
@@ -508,14 +303,18 @@ where
         }
 
         let final_count = if content_kind == TransferContentKind::Bundle {
-            let extracted = bundle::extract_bundle(&temp_dest, &final_dest).await?;
-            tokio::fs::remove_file(&temp_dest).await?;
-            extracted
+            let archive = partial.0.take().expect("received archive has an owner");
+            bundle::extract_bundle_owned(archive, &final_dest).await?
         } else {
             tokio::fs::rename(&temp_dest, &final_dest).await?;
             1
         };
-        crypto::encrypted_write(writer, transport, b"DONE\n").await?;
+        partial.0 = None;
+        bounded(
+            "sending receiver confirmation",
+            crypto::encrypted_write(writer, transport, b"DONE\n"),
+        )
+        .await?;
         Ok((final_dest.clone(), final_count))
     }
     .await;
@@ -524,9 +323,6 @@ where
         Ok(result) => result,
         Err(err) => {
             let _ = tokio::fs::remove_file(&temp_dest).await;
-            if content_kind == TransferContentKind::Bundle {
-                let _ = tokio::fs::remove_dir_all(&final_dest).await;
-            }
             return Err(err);
         }
     };
@@ -548,16 +344,71 @@ where
     };
     status(sink, success_status);
     status(sink, "Checksum verified (blake3).");
-    emit(
-        sink,
-        TransferEvent::Completed(TransferCompleted {
-            file_name: completed_name,
-            size_bytes: header.size,
-            saved_path: Some(saved_path),
-            content_kind,
-            item_count: completed_count,
-        }),
-    );
+    Ok(TransferCompleted {
+        file_name: completed_name,
+        size_bytes: header.size,
+        saved_path: Some(saved_path),
+        content_kind,
+        item_count: completed_count,
+    })
+}
 
-    Ok(())
+fn successful_peer_close(error: &ConnectionError) -> bool {
+    matches!(error, ConnectionError::ApplicationClosed(close)
+        if close.error_code == VarInt::from_u32(0)
+            && close.reason.as_ref() == engine::SUCCESS_CLOSE_REASON)
+}
+
+fn check_done_delivery(result: std::result::Result<Option<VarInt>, StoppedError>) -> Result<()> {
+    match result {
+        Ok(None) => Ok(()),
+        // The sender closes only after reading DONE. Its application close can
+        // reach us before QUIC acknowledges our final bytes, which is success too.
+        Err(StoppedError::ConnectionLost(error)) if successful_peer_close(&error) => Ok(()),
+        Ok(Some(code)) => bail!("sender stopped receiver confirmation (code {code})"),
+        Err(error) => Err(error).context("failed to deliver receiver confirmation"),
+    }
+}
+
+async fn confirm_done_delivery(conn: &Connection, stream: &mut SendStream) -> Result<()> {
+    if let Err(error) = stream.finish() {
+        if conn
+            .close_reason()
+            .as_ref()
+            .is_some_and(successful_peer_close)
+        {
+            return Ok(());
+        }
+        return Err(error).context("failed to finish receiver confirmation");
+    }
+    bounded("delivering receiver confirmation", async {
+        check_done_delivery(stream.stopped().await)
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::endpoint::ApplicationClose;
+
+    fn peer_close(code: u32, reason: &'static [u8]) -> StoppedError {
+        StoppedError::ConnectionLost(ConnectionError::ApplicationClosed(ApplicationClose {
+            error_code: VarInt::from_u32(code),
+            reason: reason.into(),
+        }))
+    }
+
+    #[test]
+    fn final_confirmation_accepts_ack_or_explicit_success_close_only() {
+        assert!(check_done_delivery(Ok(None)).is_ok());
+        assert!(check_done_delivery(Err(peer_close(0, engine::SUCCESS_CLOSE_REASON))).is_ok());
+        assert!(check_done_delivery(Err(peer_close(1, b"transfer canceled or failed"))).is_err());
+        assert!(check_done_delivery(Err(peer_close(0, b"unrelated close"))).is_err());
+        assert!(
+            check_done_delivery(Err(StoppedError::ConnectionLost(ConnectionError::TimedOut)))
+                .is_err()
+        );
+        assert!(check_done_delivery(Ok(Some(VarInt::from_u32(0)))).is_err());
+    }
 }

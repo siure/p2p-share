@@ -16,3 +16,6 @@ p2p-share-core = { path = "../core" }
 
 [build-dependencies]
 cc.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+iroh.workspace = true

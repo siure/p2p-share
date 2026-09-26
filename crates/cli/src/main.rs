@@ -9,6 +9,8 @@ use p2p_share_core::events::{
 };
 use serde::Serialize;
 
+mod worker;
+
 const TRANSFER_EVENT_SCHEMA_VERSION: &str = "1.1.0";
 
 /// p2p-share — simple peer-to-peer file transfer.
@@ -60,6 +62,9 @@ enum Command {
 
     /// Print machine-readable version metadata.
     Version,
+
+    /// Keep the transfer engine alive and accept JSON commands on stdin.
+    Worker,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,6 +81,8 @@ struct TransferEventRecord {
     latency_ms: Option<f64>,
     content_kind: Option<TransferContentKind>,
     item_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transfer_id: Option<String>,
 }
 
 impl TransferEventRecord {
@@ -93,6 +100,7 @@ impl TransferEventRecord {
             latency_ms: None,
             content_kind: None,
             item_count: None,
+            transfer_id: None,
         }
     }
 
@@ -113,12 +121,30 @@ impl TransferEventRecord {
 #[derive(Default)]
 struct StdoutJsonSink {
     write_lock: Mutex<()>,
+    transfer_id: Option<String>,
+}
+
+impl StdoutJsonSink {
+    fn for_transfer(id: String) -> Self {
+        Self {
+            write_lock: Mutex::new(()),
+            transfer_id: Some(id),
+        }
+    }
+
+    fn emit(&self, mut event: TransferEventRecord) {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        event.transfer_id.clone_from(&self.transfer_id);
+        emit_json_line(&event);
+    }
 }
 
 impl TransferEventSink for StdoutJsonSink {
     fn on_event(&self, event: TransferEvent) {
-        let _guard = self.write_lock.lock();
-        emit_json_line(&map_event(event));
+        self.emit(map_event(event));
     }
 }
 
@@ -187,6 +213,7 @@ fn emit_version_json() -> Result<()> {
     let payload = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "schema_version": TRANSFER_EVENT_SCHEMA_VERSION,
+        "capabilities": ["worker"],
     });
     let mut out = io::stdout().lock();
     writeln!(out, "{}", serde_json::to_string(&payload)?)?;
@@ -203,6 +230,7 @@ fn missing_target_error() -> anyhow::Error {
 
 async fn run_human(command: Command) -> Result<()> {
     match command {
+        Command::Worker => Err(anyhow!("worker requires --json")),
         Command::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -234,12 +262,15 @@ async fn run_json(command: Command) -> Result<()> {
     if let Command::Version = &command {
         return emit_version_json();
     }
+    if let Command::Worker = &command {
+        return worker::run().await;
+    }
 
     let sink: Arc<dyn TransferEventSink> = Arc::new(StdoutJsonSink::default());
     emit_json_line(&TransferEventRecord::status("Transfer started."));
 
     let result = match command {
-        Command::Version => unreachable!("handled above"),
+        Command::Version | Command::Worker => unreachable!("handled above"),
         Command::Send { files, to: None } => {
             p2p_share_core::sender::run_paths_with_sink(&files, Some(sink.clone())).await
         }

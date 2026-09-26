@@ -9,8 +9,10 @@ use anyhow::Result;
 use p2p_share_core::events::{
     ConnectionPathKind, TransferContentKind, TransferEvent, TransferEventSink,
 };
+use p2p_share_core::{SharedSink, TransferEngine};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,19 +64,29 @@ impl TransferEventRecord {
     }
 }
 
+const MAX_QUEUED_EVENTS: usize = 128;
+
+#[derive(Default)]
+struct EventQueue {
+    generation: u64,
+    events: VecDeque<TransferEventRecord>,
+}
+
 struct QueueSink {
-    queue: Arc<Mutex<VecDeque<TransferEventRecord>>>,
+    queue: Arc<Mutex<EventQueue>>,
+    generation: u64,
 }
 
 impl TransferEventSink for QueueSink {
     fn on_event(&self, event: TransferEvent) {
-        push_event(&self.queue, map_event(event));
+        push_event(&self.queue, self.generation, map_event(event));
     }
 }
 
 pub struct TransferController {
     runtime: Runtime,
-    queue: Arc<Mutex<VecDeque<TransferEventRecord>>>,
+    engine: Arc<OnceCell<TransferEngine>>,
+    queue: Arc<Mutex<EventQueue>>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -85,69 +97,67 @@ impl TransferController {
             .thread_name("p2p-share-runtime")
             .build()
             .expect("failed to build tokio runtime");
-
+        let engine = Arc::new(OnceCell::new());
+        let warm_engine = engine.clone();
+        runtime.spawn(async move {
+            let _ = warm_engine.get_or_try_init(TransferEngine::bind).await;
+        });
         Self {
             runtime,
-            queue: Arc::new(Mutex::new(VecDeque::new())),
+            engine,
+            queue: Arc::new(Mutex::new(EventQueue::default())),
             task: Mutex::new(None),
         }
     }
 
     pub fn start_send_wait(&self, file_paths: Vec<String>) {
-        let file_paths: Vec<PathBuf> = file_paths.into_iter().map(PathBuf::from).collect();
-        let queue = self.queue.clone();
-        self.start_task(async move {
-            p2p_share_core::sender::run_paths_with_sink(
-                &file_paths,
-                Some(Arc::new(QueueSink { queue }) as Arc<dyn TransferEventSink>),
-            )
-            .await
+        let paths: Vec<PathBuf> = file_paths.into_iter().map(PathBuf::from).collect();
+        self.start_task(move |engine, sink| async move {
+            engine
+                .get_or_try_init(TransferEngine::bind)
+                .await?
+                .send_paths(&paths, None, Some(sink))
+                .await
         });
     }
 
     pub fn start_send_to_ticket(&self, file_paths: Vec<String>, ticket: impl Into<String>) {
-        let file_paths: Vec<PathBuf> = file_paths.into_iter().map(PathBuf::from).collect();
+        let paths: Vec<PathBuf> = file_paths.into_iter().map(PathBuf::from).collect();
         let ticket = ticket.into();
-        let queue = self.queue.clone();
-        self.start_task(async move {
-            p2p_share_core::sender::run_reverse_paths_with_sink(
-                &file_paths,
-                &ticket,
-                Some(Arc::new(QueueSink { queue }) as Arc<dyn TransferEventSink>),
-            )
-            .await
+        self.start_task(move |engine, sink| async move {
+            engine
+                .get_or_try_init(TransferEngine::bind)
+                .await?
+                .send_paths(&paths, Some(&ticket), Some(sink))
+                .await
         });
     }
 
     pub fn start_receive_target(&self, target: impl Into<String>, output_dir: impl Into<String>) {
         let target = target.into();
-        let output_dir = PathBuf::from(output_dir.into());
-        let queue = self.queue.clone();
-        self.start_task(async move {
-            p2p_share_core::receiver::run_with_sink(
-                &target,
-                output_dir.as_path(),
-                Some(Arc::new(QueueSink { queue }) as Arc<dyn TransferEventSink>),
-            )
-            .await
+        let output = PathBuf::from(output_dir.into());
+        self.start_task(move |engine, sink| async move {
+            engine
+                .get_or_try_init(TransferEngine::bind)
+                .await?
+                .receive(Some(&target), &output, Some(sink))
+                .await
         });
     }
 
     pub fn start_receive_listen(&self, output_dir: impl Into<String>) {
-        let output_dir = PathBuf::from(output_dir.into());
-        let queue = self.queue.clone();
-        self.start_task(async move {
-            p2p_share_core::receiver::run_listen_with_sink(
-                output_dir.as_path(),
-                Some(Arc::new(QueueSink { queue }) as Arc<dyn TransferEventSink>),
-            )
-            .await
+        let output = PathBuf::from(output_dir.into());
+        self.start_task(move |engine, sink| async move {
+            engine
+                .get_or_try_init(TransferEngine::bind)
+                .await?
+                .receive(None, &output, Some(sink))
+                .await
         });
     }
 
     pub fn poll_event(&self) -> Option<TransferEventRecord> {
-        let mut queue = self.queue.lock().ok()?;
-        queue.pop_front()
+        self.queue.lock().ok()?.events.pop_front()
     }
 
     pub fn poll_event_json(&self) -> Option<String> {
@@ -156,38 +166,60 @@ impl TransferController {
     }
 
     pub fn cancel(&self) {
-        if let Ok(mut task) = self.task.lock() {
-            if let Some(handle) = task.take() {
+        if let Ok(task) = self.task.lock() {
+            if let Some(handle) = task.as_ref() {
                 handle.abort();
-                push_event(
-                    &self.queue,
-                    TransferEventRecord::status("Transfer canceled by user."),
-                );
             }
+        }
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.generation += 1;
+            queue.events.clear();
         }
     }
 
-    fn start_task<F>(&self, fut: F)
+    fn start_task<F, Fut>(&self, action: F)
     where
-        F: std::future::Future<Output = Result<()>> + Send + 'static,
+        F: FnOnce(Arc<OnceCell<TransferEngine>>, SharedSink) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         self.cancel();
-
+        let previous = self.task.lock().expect("task lock").take();
         let queue = self.queue.clone();
-        push_event(&queue, TransferEventRecord::status("Transfer started."));
-
+        let generation = queue.lock().expect("queue lock").generation;
+        let sink = Arc::new(QueueSink {
+            queue: queue.clone(),
+            generation,
+        });
+        let engine = self.engine.clone();
+        push_event(
+            &queue,
+            generation,
+            TransferEventRecord::status("Transfer started."),
+        );
         let task = self.runtime.spawn(async move {
-            if let Err(err) = fut.await {
+            // Ensure cancellation released the engine's active-transfer lock.
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            if let Err(err) = action(engine, sink).await {
                 push_event(
                     &queue,
+                    generation,
                     TransferEventRecord::error("transfer_error", format!("{:#}", err)),
                 );
             }
         });
+        *self.task.lock().expect("task lock") = Some(task);
+    }
 
-        if let Ok(mut current) = self.task.lock() {
-            *current = Some(task);
-        }
+    fn shutdown(self) {
+        self.cancel();
+        self.runtime.block_on(async {
+            if let Some(engine) = self.engine.get() {
+                engine.close().await;
+            }
+        });
+        // Dropping the runtime joins its workers on the destruction thread.
     }
 }
 
@@ -201,9 +233,24 @@ pub fn bindings_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-fn push_event(queue: &Arc<Mutex<VecDeque<TransferEventRecord>>>, event: TransferEventRecord) {
+fn push_event(queue: &Arc<Mutex<EventQueue>>, generation: u64, event: TransferEventRecord) {
     if let Ok(mut q) = queue.lock() {
-        q.push_back(event);
+        if generation != q.generation {
+            return;
+        }
+        if event.kind == "progress" {
+            q.events.retain(|old| old.kind != "progress");
+        }
+        if q.events.len() >= MAX_QUEUED_EVENTS {
+            // Keep terminal results even if status updates outpace the UI.
+            let oldest = q
+                .events
+                .iter()
+                .position(|old| old.kind != "completed" && old.kind != "error")
+                .unwrap_or(0);
+            q.events.remove(oldest);
+        }
+        q.events.push_back(event);
     }
 }
 
@@ -336,6 +383,19 @@ unsafe extern "C" {
     fn p2pshare_jni_register(vm: *mut c_void) -> i32;
 }
 
+/// Install the process-wide application context before creating endpoints.
+///
+/// # Safety
+/// Both pointers must remain valid for the process lifetime; call exactly once.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn p2pshare_android_initialize(vm: *mut c_void, context: *mut c_void) {
+    // The C bridge retains one application global reference for the process lifetime.
+    unsafe {
+        iroh::dns::install_android_jni_context(vm, context);
+    }
+}
+
 #[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "C" fn JNI_OnLoad(vm: *mut c_void, _reserved: *mut c_void) -> i32 {
@@ -347,6 +407,17 @@ pub extern "C" fn JNI_OnLoad(vm: *mut c_void, _reserved: *mut c_void) -> i32 {
 pub extern "C" fn p2pshare_controller_create() -> u64 {
     let controller = Box::new(TransferController::new());
     Box::into_raw(controller) as u64
+}
+
+/// The caller must stop using the handle before destroying it, exactly once.
+#[no_mangle]
+pub extern "C" fn p2pshare_controller_destroy(handle: u64) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: JNI serializes access and clears its handle before this call.
+    let controller = unsafe { Box::from_raw(handle as *mut TransferController) };
+    std::thread::spawn(move || controller.shutdown());
 }
 
 #[no_mangle]
@@ -434,5 +505,77 @@ pub extern "C" fn p2pshare_free_cstring(ptr: *const c_char) {
     // SAFETY: ptr must be returned by CString::into_raw in this crate.
     unsafe {
         let _ = CString::from_raw(ptr as *mut c_char);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_coalesces_progress_and_bounds_status_backlog() {
+        let queue = Arc::new(Mutex::new(EventQueue::default()));
+        for done in 0..1000 {
+            push_event(
+                &queue,
+                0,
+                map_event(TransferEvent::Progress { done, total: 1000 }),
+            );
+        }
+        assert_eq!(queue.lock().unwrap().events.len(), 1);
+        assert_eq!(queue.lock().unwrap().events[0].done, Some(999));
+        push_event(&queue, 0, TransferEventRecord::error("test", "terminal"));
+        for _ in 0..1000 {
+            push_event(&queue, 0, TransferEventRecord::status("status"));
+        }
+        let queue = queue.lock().unwrap();
+        assert_eq!(queue.events.len(), MAX_QUEUED_EVENTS);
+        assert!(queue.events.iter().any(|event| event.kind == "error"));
+    }
+
+    #[test]
+    fn destroying_controller_releases_pending_task() {
+        struct OnDrop(std::sync::mpsc::Sender<()>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let signal = OnDrop(sender);
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let task = runtime.spawn(async move {
+            let _signal = signal;
+            std::future::pending::<()>().await;
+        });
+        let controller = TransferController {
+            runtime,
+            engine: Arc::new(OnceCell::new()),
+            queue: Arc::new(Mutex::new(EventQueue::default())),
+            task: Mutex::new(Some(task)),
+        };
+        p2pshare_controller_destroy(Box::into_raw(Box::new(controller)) as u64);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("native task released");
+    }
+
+    #[test]
+    fn canceled_generation_cannot_deliver_stale_events() {
+        let queue = Arc::new(Mutex::new(EventQueue {
+            generation: 1,
+            ..Default::default()
+        }));
+        push_event(&queue, 0, TransferEventRecord::error("old", "old transfer"));
+        push_event(&queue, 1, TransferEventRecord::status("current transfer"));
+        assert_eq!(queue.lock().unwrap().events.len(), 1);
+        assert_eq!(
+            queue.lock().unwrap().events[0].message.as_deref(),
+            Some("current transfer")
+        );
     }
 }

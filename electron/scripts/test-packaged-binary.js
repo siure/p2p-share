@@ -2,6 +2,13 @@
 
 const fs = require("fs");
 const path = require("path");
+const { execFileSync } = require("node:child_process");
+const asar = require("@electron/asar");
+const projectRoot = path.resolve(__dirname, "..");
+const expectedVersion = require("../package.json").version;
+const schemaSource = fs.readFileSync(path.join(projectRoot, "src/shared/schema.ts"), "utf8");
+const expectedSchema = /TRANSFER_EVENT_SCHEMA_VERSION = "([^"]+)"/.exec(schemaSource)?.[1];
+if (!expectedSchema) fail("Could not read expected event schema version.");
 
 function fail(message) {
   console.error(`FAIL: ${message}`);
@@ -48,6 +55,14 @@ function verifyUnpackedDir(unpackedDir) {
     return { checked: true, ok: false, error: `${name}: resources directory not found.` };
   }
 
+  const packagedApp = JSON.parse(asar.extractFile(path.join(resourcesDir, "app.asar"), "package.json").toString());
+  if (packagedApp.version !== expectedVersion) {
+    return { checked: true, ok: false, error: `${name}: packaged app ${packagedApp.version} differs from source ${expectedVersion}.` };
+  }
+  const nativeOs = { win32: "win", darwin: "mac", linux: "linux" }[process.platform];
+  if (osKey !== nativeOs) {
+    return { checked: true, ok: false, error: `${name}: run CLI verification on its target OS (${osKey}).` };
+  }
   const binaryName = osKey === "win" ? "p2p-share.exe" : "p2p-share";
   const osBinRoot = path.join(resourcesDir, "bin", osKey);
   if (!fs.existsSync(osBinRoot)) {
@@ -83,7 +98,23 @@ function verifyUnpackedDir(unpackedDir) {
         error: `${name}: binary is not executable at ${path.relative(process.cwd(), binaryPath)}.`
       };
     }
-    info(`${name}: verified ${path.relative(process.cwd(), binaryPath)}`);
+    if (arch !== process.arch) {
+      return { checked: true, ok: false, error: `${name}: run CLI verification on its target architecture (${arch}).` };
+    }
+    try {
+      const version = JSON.parse(execFileSync(binaryPath, ["version", "--json"], {
+        encoding: "utf8", timeout: 8000, maxBuffer: 64 * 1024, windowsHide: true
+      }));
+      if (version.version !== expectedVersion || version.schema_version !== expectedSchema) {
+        throw new Error(`CLI ${version.version}/schema ${version.schema_version}; expected ${expectedVersion}/${expectedSchema}`);
+      }
+      if (!Array.isArray(version.capabilities) || !version.capabilities.includes("worker")) {
+        throw new Error("CLI does not support the desktop worker protocol");
+      }
+    } catch (error) {
+      return { checked: true, ok: false, error: `${name}: bundled CLI verification failed: ${error.message}` };
+    }
+    info(`${name}: verified CLI ${expectedVersion}, schema ${expectedSchema}, worker support (${arch})`);
   }
 
   return { checked: true, ok: true };

@@ -1,1 +1,2 @@
-# Keep rules for future Rust/FFI glue can be added here.
+# Registered from JNI by class and method name.
+-keep class com.akily.p2pshare.bridge.RustBindings { *; }

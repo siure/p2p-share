@@ -15,6 +15,7 @@ export interface TransferEventBase {
   message?: string;
   value?: string;
   schema_version?: string;
+  transfer_id?: string;
 }
 
 export interface TransferEventStatus extends TransferEventBase {
@@ -91,6 +92,7 @@ export interface CliBuildInfo {
   exists: boolean;
   version: string | null;
   schemaVersion: string | null;
+  capabilities: string[];
   compatibility: SchemaCompatibility;
   error: string | null;
 }

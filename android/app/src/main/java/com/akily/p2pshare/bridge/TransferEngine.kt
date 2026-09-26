@@ -26,6 +26,7 @@ interface TransferEngine {
     fun startReceiveListen(outputDir: String)
     fun pollEvent(): BridgeEvent?
     fun cancel()
+    fun close() = cancel()
 }
 
 class DemoTransferEngine : TransferEngine {

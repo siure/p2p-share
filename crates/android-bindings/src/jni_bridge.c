@@ -2,6 +2,8 @@
 #include <stdint.h>
 
 extern uint64_t p2pshare_controller_create(void);
+extern void p2pshare_android_initialize(void *vm, void *context);
+extern void p2pshare_controller_destroy(uint64_t handle);
 extern void p2pshare_controller_start_send_wait(uint64_t handle, const char *file_paths_json);
 extern void p2pshare_controller_start_send_to_ticket(
     uint64_t handle,
@@ -17,6 +19,21 @@ extern void p2pshare_controller_start_receive_listen(uint64_t handle, const char
 extern const char *p2pshare_controller_poll_event_json(uint64_t handle);
 extern void p2pshare_controller_cancel(uint64_t handle);
 extern void p2pshare_free_cstring(const char *ptr);
+
+static jboolean native_initialize(JNIEnv *env, jclass clazz, jobject context) {
+    (void) clazz;
+    // Called once under RustBindings' monitor before the first endpoint is built.
+    static jobject application_context = NULL;
+    if (application_context != NULL) return JNI_TRUE;
+    if (context == NULL) return JNI_FALSE;
+    JavaVM *vm = NULL;
+    if ((*env)->GetJavaVM(env, &vm) != JNI_OK) return JNI_FALSE;
+    jobject retained = (*env)->NewGlobalRef(env, context);
+    if (retained == NULL) return JNI_FALSE;
+    p2pshare_android_initialize(vm, retained);
+    application_context = retained;
+    return JNI_TRUE;
+}
 
 static jlong native_create_controller(JNIEnv *env, jclass clazz) {
     (void) env;
@@ -123,6 +140,12 @@ static void native_cancel(JNIEnv *env, jclass clazz, jlong handle) {
     p2pshare_controller_cancel((uint64_t) handle);
 }
 
+static void native_destroy_controller(JNIEnv *env, jclass clazz, jlong handle) {
+    (void) env;
+    (void) clazz;
+    p2pshare_controller_destroy((uint64_t) handle);
+}
+
 int p2pshare_jni_register(JavaVM *vm) {
     JNIEnv *env = NULL;
     if ((*vm)->GetEnv(vm, (void **) &env, JNI_VERSION_1_6) != JNI_OK) {
@@ -135,7 +158,9 @@ int p2pshare_jni_register(JavaVM *vm) {
     }
 
     static const JNINativeMethod methods[] = {
+        {"nativeInitialize", "(Landroid/content/Context;)Z", (void *) native_initialize},
         {"nativeCreateController", "()J", (void *) native_create_controller},
+        {"nativeDestroyController", "(J)V", (void *) native_destroy_controller},
         {"nativeStartSendWait", "(JLjava/lang/String;)V", (void *) native_start_send_wait},
         {"nativeStartSendToTicket", "(JLjava/lang/String;Ljava/lang/String;)V", (void *) native_start_send_to_ticket},
         {"nativeStartReceiveTarget", "(JLjava/lang/String;Ljava/lang/String;)V", (void *) native_start_receive_target},

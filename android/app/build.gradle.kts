@@ -24,12 +24,13 @@ android {
 
     namespace = "com.akily.p2pshare"
     compileSdk = 35
+    ndkVersion = "27.0.12077973"
     defaultConfig {
         applicationId = "com.akily.p2pshare"
         minSdk = 29
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.3.4"
+        versionCode = 5
+        versionName = "0.4.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -54,7 +55,8 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -79,6 +81,10 @@ android {
     }
 
     packaging {
+        jniLibs {
+            // These dependency artifacts are linked statically into our JNI library.
+            excludes += listOf("**/libiroh-*.so", "**/libiroh_relay-*.so")
+        }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
@@ -86,7 +92,7 @@ android {
 
     sourceSets {
         getByName("main") {
-            jniLibs.srcDirs("src/main/jniLibs")
+            jniLibs.setSrcDirs(listOf(layout.buildDirectory.dir("generated/rustJniLibs")))
         }
     }
 }
@@ -119,3 +125,19 @@ dependencies {
     androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
 }
+
+// Native code is a build input, rather than a manually refreshed checked-in binary.
+val generatedJni = layout.buildDirectory.dir("generated/rustJniLibs")
+val buildRustJni by tasks.registering(Exec::class) {
+    val repository = rootProject.projectDir.parentFile
+    inputs.files(fileTree(File(repository, "crates")) {
+        include("**/*.rs", "**/*.c", "**/Cargo.toml")
+    })
+    inputs.files(File(repository, "Cargo.toml"), File(repository, "Cargo.lock"),
+        rootProject.file("scripts/build-rust-android.sh"))
+    outputs.dir(generatedJni)
+    environment("ANDROID_NDK_HOME", androidComponents.sdkComponents.ndkDirectory.get().asFile.absolutePath)
+    commandLine("bash", rootProject.file("scripts/build-rust-android.sh").absolutePath,
+        generatedJni.get().asFile.absolutePath)
+}
+tasks.named("preBuild").configure { dependsOn(buildRustJni) }
