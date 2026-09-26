@@ -57,15 +57,16 @@ jobs:
             exit 1
           fi
 
-      - name: Warn if Android versionName differs
+      - name: Ensure Android versionName matches tag
         run: |
           android_version=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' android/app/build.gradle.kts | head -n 1)
           if [ -z "$android_version" ]; then
-            echo "::warning::Failed to parse Android versionName from android/app/build.gradle.kts"
-            exit 0
+            echo "Failed to parse Android versionName from android/app/build.gradle.kts"
+            exit 1
           fi
           if [ "$android_version" != "${{ steps.version.outputs.version }}" ]; then
-            echo "::warning::Android versionName ($android_version) differs from tag version (${{ steps.version.outputs.version }})"
+            echo "Android versionName ($android_version) differs from tag version (${{ steps.version.outputs.version }})"
+            exit 1
           fi
 
   build-cli:
@@ -212,6 +213,12 @@ jobs:
           mkdir -p dist
           cp android/app/build/outputs/apk/release/app-release.apk \
              dist/p2p-share-android-v${{ needs.validate-tag.outputs.version }}.apk
+          python3 scripts/android-update.py \
+            --metadata android/app/build/outputs/apk/release/output-metadata.json \
+            --apk dist/p2p-share-android-v${{ needs.validate-tag.outputs.version }}.apk \
+            --repository "${{ github.repository }}" \
+            --version "${{ needs.validate-tag.outputs.version }}" \
+            --output dist/android-update.json
 
       - name: Upload Android artifact
         if: steps.android_signing.outputs.enabled == 'true'
@@ -279,37 +286,17 @@ jobs:
         working-directory: electron
         run: npm run test:packaged-binary
 
-      - name: Normalize Linux GUI artifact names
-        if: matrix.os_name == 'linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          version="${{ needs.validate-tag.outputs.version }}"
-          appimage="$(ls electron/dist/*.AppImage | head -n 1)"
-          tarball="$(ls electron/dist/*.tar.gz | head -n 1)"
-          cp "$appimage" "dist/p2p-share-gui-v${version}-linux-x86_64.AppImage"
-          cp "$tarball" "dist/p2p-share-gui-v${version}-linux-x86_64.tar.gz"
-
-      - name: Normalize Windows GUI artifact names
-        if: matrix.os_name == 'windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $version = "${{ needs.validate-tag.outputs.version }}"
-          $exe = Get-ChildItem -Path electron/dist -Filter *.exe | Select-Object -First 1
-          if (-not $exe) { throw "No .exe artifact found in electron/dist" }
-          Copy-Item $exe.FullName "dist/p2p-share-gui-v$version-windows-x86_64.exe"
-
-          $zip = Get-ChildItem -Path electron/dist -Filter *.zip | Select-Object -First 1
-          if (-not $zip) { throw "No .zip artifact found in electron/dist" }
-          Copy-Item $zip.FullName "dist/p2p-share-gui-v$version-windows-x86_64.zip"
-
-      - name: Upload desktop artifact
+      - name: Upload desktop artifacts and update metadata
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: dist/*
+          path: |
+            electron/dist/*.AppImage
+            electron/dist/*.tar.gz
+            electron/dist/*.exe
+            electron/dist/*.zip
+            electron/dist/*.blockmap
+            electron/dist/latest*.yml
           if-no-files-found: error
 
   publish-release:
@@ -333,9 +320,9 @@ jobs:
       - name: Download Android artifact
         uses: actions/download-artifact@v4
         with:
-          name: android-apk
+          pattern: android-apk
           path: dist
-          if-no-files-found: ignore
+          merge-multiple: true
 
       - name: Download desktop artifacts
         uses: actions/download-artifact@v4

@@ -105,6 +105,28 @@ When you push a tag `vX.Y.Z`, the release workflow publishes:
 - `p2p-share-gui-vX.Y.Z-windows-x86_64.zip`
 - `p2p-share-android-vX.Y.Z.apk` (when Android signing secrets are configured)
 - `p2p-share-checksums-vX.Y.Z.txt`
+- `latest.yml`, `latest-linux.yml`, and installer blockmaps for desktop updates
+- `android-update.json` when the signed Android APK is built
+
+### App updates
+
+Installed Windows apps, Linux AppImages, and Android release builds check GitHub at startup.
+An available update appears in a row with an **Update** action. Downloads run in the background;
+desktop users then choose **Restart and install**, and Android users choose **Install**.
+Installation stays disabled while files are being prepared or transferred. Failed checks and
+downloads can be retried without closing the app.
+
+Android asks users to allow installs from P2P Share, then uses the system installer for
+confirmation. APK downloads are checked against the release's size and SHA-256 checksum;
+Android verifies that the signing key matches the installed app. Keep the same release keystore.
+Debug builds and desktop `.zip`/`.tar.gz` distributions keep manual updates.
+Users must manually install the first release containing the updater.
+
+Desktop artifact names are set by electron-builder so the generated update metadata stays
+consistent. Upload the metadata and blockmaps alongside the installers without renaming them.
+The Android manifest is generated from Gradle's APK metadata. Both apps use the public
+`siure/p2p-share` releases; forks must change the desktop publish configuration and Android's
+`RELEASES_URL` before distributing builds.
 
 ### Required GitHub secrets for Android signing
 
@@ -117,7 +139,9 @@ Set these in `Settings -> Secrets and variables -> Actions`:
 
 ### Create a release
 
-1. Ensure `crates/cli/Cargo.toml` version matches the intended tag version.
+1. Set the same version in `Cargo.toml` (`workspace.package`), `electron/package.json`
+   (and its lockfile), and `android/app/build.gradle.kts` (`versionName`). Android derives
+   `versionCode` as `major * 1,000,000 + minor * 1,000 + patch`; each component must be 0–999.
 2. Create and push a tag:
 
 ```bash

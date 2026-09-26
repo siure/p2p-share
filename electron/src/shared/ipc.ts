@@ -103,7 +103,17 @@ export interface BuildInfo {
   cli: CliBuildInfo;
 }
 
+export interface UpdateState {
+  status: "idle" | "checking" | "available" | "downloading" | "ready" | "installing" | "error";
+  version?: string;
+  percent?: number;
+  message?: string;
+}
+
 export interface P2PShareApi {
+  getUpdateState: () => Promise<UpdateState>;
+  updateAction: () => Promise<void>;
+  onUpdateState: (handler: (state: UpdateState) => void) => () => void;
   getPlatformInfo: () => Promise<PlatformInfo>;
   getBuildInfo: () => Promise<BuildInfo>;
   getDefaultOutputDir: () => Promise<string>;

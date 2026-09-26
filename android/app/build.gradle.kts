@@ -29,8 +29,11 @@ android {
         applicationId = "com.akily.p2pshare"
         minSdk = 29
         targetSdk = 35
-        versionCode = 5
         versionName = "0.4.0"
+        // Preserve semantic version ordering without a separate release counter.
+        val parts = versionName!!.split('.').map(String::toInt)
+        require(parts.size == 3 && parts.all { it in 0..999 })
+        versionCode = parts[0] * 1_000_000 + parts[1] * 1_000 + parts[2]
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -78,6 +81,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     packaging {

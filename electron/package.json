@@ -13,13 +13,15 @@
     "build:cli": "cargo build --release -p p2p-share",
     "test:packaged-binary": "node ./scripts/test-packaged-binary.js",
     "dist": "npm run build:cli && npm run build && electron-builder --dir && npm run test:packaged-binary",
-    "dist:linux": "npm run build:cli && npm run build && electron-builder --linux && npm run test:packaged-binary",
-    "dist:win": "npm run build:cli && npm run build && electron-builder --win && npm run test:packaged-binary",
+    "dist:linux": "npm run build:cli && npm run build && electron-builder --linux --publish never && npm run test:packaged-binary",
+    "dist:win": "npm run build:cli && npm run build && electron-builder --win --publish never && npm run test:packaged-binary",
     "test:worker": "tsc --target ES2022 --module commonjs --moduleResolution node --esModuleInterop --skipLibCheck --outDir out/tests src/main/worker-client.ts && node --test tests/worker-client.test.cjs",
     "dist:linux:dir": "npm run build:cli && npm run build && electron-builder --linux --dir && npm run test:packaged-binary",
-    "start:linux:unpacked": "./dist/linux-unpacked/p2p-share-electron"
+    "start:linux:unpacked": "./dist/linux-unpacked/p2p-share-electron",
+    "test:updates": "tsc --target ES2022 --module commonjs --moduleResolution node --esModuleInterop --skipLibCheck --outDir out/tests src/main/updates.ts && node --test tests/updates.test.cjs"
   },
   "dependencies": {
+    "electron-updater": "^6.8.9",
     "qrcode": "^1.5.4"
   },
   "devDependencies": {
@@ -59,13 +61,24 @@
         "tar.gz"
       ],
       "category": "Utility",
-      "icon": "build/icons"
+      "icon": "build/icons",
+      "artifactName": "p2p-share-gui-v${version}-linux-x86_64.${ext}"
     },
     "win": {
       "target": [
         "nsis",
         "zip"
-      ]
+      ],
+      "artifactName": "p2p-share-gui-v${version}-windows-x86_64.${ext}"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "siure",
+      "repo": "p2p-share",
+      "releaseType": "release"
+    },
+    "nsis": {
+      "include": "build/installer.nsh"
     }
   },
   "devEngines": {

@@ -1,8 +1,15 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 
-import type { P2PShareApi, StartTransferPayload, TransferEvent } from "../shared/ipc";
+import type { P2PShareApi, StartTransferPayload, TransferEvent, UpdateState } from "../shared/ipc";
 
 const api: P2PShareApi = {
+  getUpdateState: () => ipcRenderer.invoke("updates:state"),
+  updateAction: () => ipcRenderer.invoke("updates:action"),
+  onUpdateState: (handler) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, state: UpdateState) => handler(state);
+    ipcRenderer.on("updates:state", wrapped);
+    return () => ipcRenderer.removeListener("updates:state", wrapped);
+  },
   getPlatformInfo: () => ipcRenderer.invoke("app:get-platform-info"),
   getBuildInfo: () => ipcRenderer.invoke("app:get-build-info"),
   getDefaultOutputDir: () => ipcRenderer.invoke("app:get-default-output-dir"),

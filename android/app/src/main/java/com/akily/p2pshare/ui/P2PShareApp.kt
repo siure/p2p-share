@@ -104,13 +104,15 @@ import com.journeyapps.barcodescanner.ScanOptions
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import com.akily.p2pshare.update.UpdateRow
+import com.akily.p2pshare.update.UpdateViewModel
 
 private val AccentViolet = Color(0xFFFF8F74)
 private val BottomGlowMauve = Color(0xFFFF8F74)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun P2PShareApp(viewModel: TransferViewModel) {
+fun P2PShareApp(viewModel: TransferViewModel, updateViewModel: UpdateViewModel) {
     val sendUi = viewModel.sendUi
     val receiveUi = viewModel.receiveUi
     val send = viewModel.sendForm
@@ -201,6 +203,8 @@ fun P2PShareApp(viewModel: TransferViewModel) {
                     style = MaterialTheme.typography.headlineMedium,
                     color = NightText,
                 )
+
+                UpdateRow(updateViewModel, viewModel.isBusy())
 
                 HorizontalPager(
                     state = pagerState,

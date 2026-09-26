@@ -64,6 +64,27 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+.update-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.update-row button {
+  color: var(--accent);
+  background: transparent;
+  border: 0;
+  padding: 8px;
+  font: inherit;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.update-row button:disabled { color: var(--text-secondary); cursor: default; }
+
 /* --- Scrollbar --- */
 
 ::-webkit-scrollbar {

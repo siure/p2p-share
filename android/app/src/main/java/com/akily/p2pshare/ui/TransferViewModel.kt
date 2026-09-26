@@ -244,6 +244,11 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun isBusy(): Boolean = listOf(sendUi, receiveUi).any {
+        it.stage in listOf(TransferStage.PREPARING, TransferStage.WAITING,
+            TransferStage.VERIFYING, TransferStage.TRANSFERRING)
+    }
+
     fun canCancelSend(): Boolean {
         if (activeDirection != "send") return false
         return when (sendUi.stage) {

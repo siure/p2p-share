@@ -6,6 +6,8 @@ import readline from "node:readline";
 import type { Readable } from "node:stream";
 import { promisify } from "node:util";
 import { WorkerClient, type WorkerTransfer } from "./worker-client";
+import { autoUpdater } from "electron-updater";
+import { Updates, isAppImageLaunch } from "./updates";
 
 import type { BuildInfo, StartTransferPayload, TransferEvent, TransferMode } from "../shared/ipc";
 import { evaluateSchemaCompatibility, TRANSFER_EVENT_SCHEMA_VERSION } from "../shared/schema";
@@ -31,6 +33,7 @@ let worker: WorkerClient | null = null;
 let startingTransfer = false;
 let cancelPendingStart = false;
 let quitting = false;
+let updates: Updates | null = null;
 let cachedBuildInfo: Promise<BuildInfo> | null = null;
 const execFileAsync = promisify(execFile);
 
@@ -703,8 +706,29 @@ ipcMain.handle("transfer:cancel", async () => ({
   ok: cancelTransfer()
 }));
 
+ipcMain.handle("updates:state", () => updates?.state ?? { status: "idle" });
+ipcMain.handle("updates:action", async () => {
+  if (updates?.state.status === "available") await updates.download();
+  else if (updates?.state.status === "ready") await updates.install();
+  else if (updates?.state.status === "error") await updates.check();
+});
+
 app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
+  // Archives stay portable; only installed NSIS apps and AppImages update in place.
+  const updateable = process.platform === "linux" ? isAppImageLaunch(process.execPath, process.env.APPDIR, process.env.APPIMAGE)
+    : process.platform === "win32" && fs.existsSync(path.join(process.resourcesPath, "installed-by-nsis"));
+  if (app.isPackaged && updateable) {
+    updates = new Updates(autoUpdater, (state) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("updates:state", state);
+    }, () => startingTransfer || Boolean(worker?.busy) || activeTransfer !== null || quitting,
+    async () => {
+      quitting = true;
+      await worker?.shutdown();
+      worker = null;
+    }, () => { quitting = false; });
+    void updates.check();
+  }
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {

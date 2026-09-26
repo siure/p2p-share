@@ -56,3 +56,9 @@ The desktop probes `version --json` asynchronously once per app session, then st
 The UI uses system fonts and does not request remote assets. Progress rendering is batched per animation frame. The optional event log keeps the last 200 non-progress events and only renders while open.
 
 See [the event contract](docs/event-schema.md) for transfer fields. Release automation lives in `../.github/workflows/release.yml`.
+
+Installed NSIS apps and AppImages check GitHub Releases on startup using `electron-updater`.
+Users choose when to download and when to restart and install; active transfers block installation.
+The NSIS installer writes a marker so ZIP distributions keep manual updates. Development builds
+and Linux tarballs also skip the updater. `npm run test:updates` covers the updater lifecycle.
+See [app updates](../README.md#app-updates) for release metadata and Android behavior.

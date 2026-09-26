@@ -1,4 +1,4 @@
-import type { BuildInfo, P2PShareApi, StartTransferPayload, TransferEvent } from "../shared/ipc";
+import type { BuildInfo, P2PShareApi, StartTransferPayload, TransferEvent, UpdateState } from "../shared/ipc";
 import { evaluateSchemaCompatibility, TRANSFER_EVENT_SCHEMA_VERSION } from "../shared/schema";
 
 const api: P2PShareApi | undefined = window.p2pShareApi;
@@ -64,6 +64,27 @@ const logPanel = $("logPanel");
 const logChevron = $("logChevron");
 const clearLogBtn = $<HTMLButtonElement>("clearLogBtn");
 const eventLog = $<HTMLPreElement>("eventLog");
+const updateRow = $("updateRow");
+const updateMessage = $("updateMessage");
+const updateButton = $<HTMLButtonElement>("updateButton");
+let updateState: UpdateState = { status: "idle" };
+
+function renderUpdate(state = updateState): void {
+  updateState = state;
+  updateRow.classList.toggle("hidden", state.status === "idle" || state.status === "checking");
+  updateMessage.textContent = state.status === "available" ? `Version ${state.version} is available.`
+    : state.status === "downloading" ? `Downloading update: ${state.percent ?? 0}%`
+    : state.status === "ready" ? (isRunning ? "Update ready. Finish the transfer to install." : "Update ready.")
+    : state.status === "installing" ? "Installing update..." : state.message ?? "";
+  updateButton.textContent = state.status === "ready" ? "Restart and install"
+    : state.status === "error" ? "Try again" : "Update";
+  updateButton.disabled = !["available", "ready", "error"].includes(state.status)
+    || (state.status === "ready" && isRunning);
+}
+
+updateButton.addEventListener("click", () => {
+  void api?.updateAction().catch((error) => pushLog(`Update: ${errorMessage(error)}`));
+});
 
 let mode: UiMode = "send";
 let subMode: TransferMode = "send_wait";
@@ -331,10 +352,12 @@ async function startTransfer(): Promise<void> {
 
   try {
     isRunning = true;
+    renderUpdate();
     switchToTransfer();
     await desktopApi.startTransfer(payload);
   } catch (err) {
     isRunning = false;
+    renderUpdate();
     statusDot.className = "status-dot status-dot--error";
     statusText.textContent = "Failed to start";
     p2pViz.classList.add("p2p-viz--error");
@@ -495,6 +518,7 @@ function handleTransferEvent(evt: TransferEvent): void {
 
     case "process_end":
       isRunning = false;
+      renderUpdate();
       if (evt.value === "canceled") {
         switchToConfig();
       } else {
@@ -671,6 +695,8 @@ function init(): void {
   }
 
   desktopApi.onTransferEvent(handleTransferEvent);
+  desktopApi.onUpdateState(renderUpdate);
+  void desktopApi.getUpdateState().then(renderUpdate).catch(() => {});
   desktopApi
     .getPlatformInfo()
     .then((info) => {

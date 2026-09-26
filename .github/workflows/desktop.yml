@@ -81,6 +81,10 @@ jobs:
         working-directory: electron
         run: npm run test:worker
 
+      - name: Test desktop updates
+        working-directory: electron
+        run: npm run test:updates
+
       - name: Build Electron desktop bundle
         working-directory: electron
         run: npm run ${{ matrix.dist_script }}

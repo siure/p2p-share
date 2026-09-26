@@ -8,16 +8,18 @@ import androidx.activity.viewModels
 import com.akily.p2pshare.ui.P2PShareApp
 import com.akily.p2pshare.ui.TransferViewModel
 import com.akily.p2pshare.ui.theme.P2PShareTheme
+import com.akily.p2pshare.update.UpdateViewModel
 
 class MainActivity : ComponentActivity() {
     private val viewModel: TransferViewModel by viewModels()
+    private val updateViewModel: UpdateViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
             P2PShareTheme {
-                P2PShareApp(viewModel)
+                P2PShareApp(viewModel, updateViewModel)
             }
         }
     }
