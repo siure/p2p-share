@@ -25,7 +25,14 @@ pub struct FileHeader {
     /// Display name for extracted bundle contents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logical_name: Option<String>,
+    /// Device name shown in the receiver's accept prompt (nearby transfers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
 }
+
+/// Nearby receivers answer the header with one of these before any file data.
+pub const OFFER_ACCEPT: &[u8] = b"ACCEPT";
+pub const OFFER_DECLINE: &[u8] = b"DECLINE";
 
 /// Single-line JSON terminated by `\n`, so the receiver can read it with
 /// `read_line`.
@@ -73,6 +80,7 @@ mod tests {
             content_kind: Some(TransferContentKind::File),
             item_count: Some(1),
             logical_name: None,
+            sender_name: Some("Laptop".to_string()),
         };
         let wire = header.to_wire().expect("serialize");
         let wire_str = String::from_utf8(wire).expect("utf8");
@@ -82,6 +90,7 @@ mod tests {
         assert_eq!(parsed.blake3, "abc123");
         assert_eq!(parsed.content_kind, Some(TransferContentKind::File));
         assert_eq!(parsed.item_count, Some(1));
+        assert_eq!(parsed.sender_name.as_deref(), Some("Laptop"));
     }
 
     #[test]

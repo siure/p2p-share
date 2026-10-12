@@ -9,6 +9,7 @@ use anyhow::Result;
 use p2p_share_core::events::{
     ConnectionPathKind, TransferContentKind, TransferEvent, TransferEventSink,
 };
+use p2p_share_core::nearby::{Browser, NearbyEvent};
 use p2p_share_core::{SharedSink, TransferEngine};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder, Runtime};
@@ -66,6 +67,38 @@ impl TransferEventRecord {
 
 const MAX_QUEUED_EVENTS: usize = 128;
 
+/// Peers found over mDNS. Android merges them with its own Bluetooth sightings.
+#[derive(Debug, Clone, Serialize)]
+struct NearbyRecord {
+    kind: &'static str,
+    peer_id: String,
+    name: Option<String>,
+    ticket: Option<String>,
+}
+
+fn map_nearby(event: NearbyEvent) -> NearbyRecord {
+    match event {
+        NearbyEvent::Found(peer) => NearbyRecord {
+            kind: "nearby_found",
+            peer_id: peer.id,
+            name: Some(peer.name),
+            ticket: Some(peer.ticket),
+        },
+        NearbyEvent::Lost(id) => NearbyRecord {
+            kind: "nearby_lost",
+            peer_id: id,
+            name: None,
+            ticket: None,
+        },
+    }
+}
+
+#[derive(Default)]
+struct BrowseState {
+    generation: u64,
+    browser: Option<Browser>,
+}
+
 #[derive(Default)]
 struct EventQueue {
     generation: u64,
@@ -83,11 +116,17 @@ impl TransferEventSink for QueueSink {
     }
 }
 
+type EngineCell = Arc<OnceCell<TransferEngine>>;
+
 pub struct TransferController {
     runtime: Runtime,
-    engine: Arc<OnceCell<TransferEngine>>,
+    /// Replaced by `rebind` so new sockets follow the process network binding.
+    engine: Mutex<EngineCell>,
+    device_name: Arc<Mutex<Option<String>>>,
     queue: Arc<Mutex<EventQueue>>,
     task: Mutex<Option<JoinHandle<()>>>,
+    browse: Arc<Mutex<BrowseState>>,
+    nearby: Arc<Mutex<VecDeque<NearbyRecord>>>,
 }
 
 impl TransferController {
@@ -97,17 +136,116 @@ impl TransferController {
             .thread_name("p2p-share-runtime")
             .build()
             .expect("failed to build tokio runtime");
+        let engine = Self::warm_engine(&runtime);
+        Self {
+            runtime,
+            engine: Mutex::new(engine),
+            device_name: Arc::new(Mutex::new(None)),
+            queue: Arc::new(Mutex::new(EventQueue::default())),
+            task: Mutex::new(None),
+            browse: Arc::new(Mutex::new(BrowseState::default())),
+            nearby: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    fn warm_engine(runtime: &Runtime) -> EngineCell {
         let engine = Arc::new(OnceCell::new());
         let warm_engine = engine.clone();
         runtime.spawn(async move {
             let _ = warm_engine.get_or_try_init(TransferEngine::bind).await;
         });
-        Self {
-            runtime,
-            engine,
-            queue: Arc::new(Mutex::new(EventQueue::default())),
-            task: Mutex::new(None),
-        }
+        engine
+    }
+
+    fn engine(&self) -> EngineCell {
+        self.engine.lock().expect("engine lock").clone()
+    }
+
+    pub fn set_device_name(&self, name: impl Into<String>) {
+        *self.device_name.lock().expect("name lock") = Some(name.into());
+    }
+
+    /// Whether the engine currently reaches its relay (has internet).
+    pub fn has_relay(&self) -> bool {
+        self.engine().get().is_some_and(TransferEngine::has_relay)
+    }
+
+    /// Answer the pending offer of a nearby receive.
+    pub fn answer_offer(&self, accept: bool) -> bool {
+        self.engine()
+            .get()
+            .is_some_and(|engine| engine.answer_offer(accept))
+    }
+
+    /// Replace the endpoint after the process switched networks (joined hotspot).
+    /// Cancels the current transfer and stops browsing.
+    pub fn rebind(&self) {
+        self.cancel();
+        self.stop_browse();
+        let old = std::mem::replace(
+            &mut *self.engine.lock().expect("engine lock"),
+            Self::warm_engine(&self.runtime),
+        );
+        let previous = self.task.lock().expect("task lock").take();
+        self.runtime.spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            if let Some(engine) = old.get() {
+                engine.close().await;
+            }
+        });
+    }
+
+    pub fn start_browse(&self) {
+        let generation = {
+            let mut state = self.browse.lock().expect("browse lock");
+            state.generation += 1;
+            state.browser = None;
+            state.generation
+        };
+        let (engine, browse, nearby) = (self.engine(), self.browse.clone(), self.nearby.clone());
+        self.runtime.spawn(async move {
+            let Ok(engine) = engine.get_or_try_init(TransferEngine::bind).await else {
+                return;
+            };
+            let browser = engine.browse_nearby(move |event| {
+                if let Ok(mut queue) = nearby.lock() {
+                    if queue.len() >= MAX_QUEUED_EVENTS {
+                        queue.pop_front();
+                    }
+                    queue.push_back(map_nearby(event));
+                }
+            });
+            let mut state = browse.lock().expect("browse lock");
+            // A stop or restart while the engine was starting wins.
+            if state.generation == generation {
+                state.browser = Some(browser);
+            }
+        });
+    }
+
+    pub fn stop_browse(&self) {
+        let mut state = self.browse.lock().expect("browse lock");
+        state.generation += 1;
+        state.browser = None;
+    }
+
+    pub fn poll_nearby_json(&self) -> Option<String> {
+        let record = self.nearby.lock().ok()?.pop_front()?;
+        serde_json::to_string(&record).ok()
+    }
+
+    /// Receive while advertised over mDNS; the app adds Bluetooth from `beacon` events.
+    pub fn start_receive_nearby(&self, output_dir: impl Into<String>) {
+        let output = PathBuf::from(output_dir.into());
+        self.start_task(move |engine, sink| async move {
+            engine
+                .get_or_try_init(TransferEngine::bind)
+                .await?
+                .receive_nearby(&output, Some(sink))
+                .await
+        });
     }
 
     pub fn start_send_wait(&self, file_paths: Vec<String>) {
@@ -179,7 +317,7 @@ impl TransferController {
 
     fn start_task<F, Fut>(&self, action: F)
     where
-        F: FnOnce(Arc<OnceCell<TransferEngine>>, SharedSink) -> Fut + Send + 'static,
+        F: FnOnce(EngineCell, SharedSink) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         self.cancel();
@@ -190,7 +328,8 @@ impl TransferController {
             queue: queue.clone(),
             generation,
         });
-        let engine = self.engine.clone();
+        let engine = self.engine();
+        let name = self.device_name.lock().expect("name lock").clone();
         push_event(
             &queue,
             generation,
@@ -200,6 +339,11 @@ impl TransferController {
             // Ensure cancellation released the engine's active-transfer lock.
             if let Some(previous) = previous {
                 let _ = previous.await;
+            }
+            if let (Some(name), Ok(engine)) =
+                (name, engine.get_or_try_init(TransferEngine::bind).await)
+            {
+                engine.set_device_name(&name);
             }
             if let Err(err) = action(engine, sink).await {
                 push_event(
@@ -214,8 +358,10 @@ impl TransferController {
 
     fn shutdown(self) {
         self.cancel();
+        self.stop_browse();
+        let engine = self.engine();
         self.runtime.block_on(async {
-            if let Some(engine) = self.engine.get() {
+            if let Some(engine) = engine.get() {
                 engine.close().await;
             }
         });
@@ -353,6 +499,24 @@ fn map_event(event: TransferEvent) -> TransferEventRecord {
             }),
             item_count: Some(result.item_count),
         },
+        TransferEvent::Offer(offer) => TransferEventRecord {
+            kind: "offer".to_string(),
+            message: offer.sender_name,
+            file_name: Some(offer.file_name),
+            size_bytes: Some(offer.size_bytes),
+            item_count: Some(offer.item_count),
+            content_kind: Some(match offer.content_kind {
+                TransferContentKind::File => "file".to_string(),
+                TransferContentKind::Bundle => "bundle".to_string(),
+            }),
+            ..TransferEventRecord::status("")
+        },
+        TransferEvent::Beacon(beacon) => TransferEventRecord {
+            kind: "beacon".to_string(),
+            message: None,
+            value: Some(beacon),
+            ..TransferEventRecord::status("")
+        },
         TransferEvent::Error { code, message } => TransferEventRecord::error(code, message),
     }
 }
@@ -479,6 +643,69 @@ pub extern "C" fn p2pshare_controller_start_receive_listen(handle: u64, output_d
 }
 
 #[no_mangle]
+pub extern "C" fn p2pshare_controller_start_receive_nearby(handle: u64, output_dir: *const c_char) {
+    let Some(output_dir) = cstr_to_string(output_dir) else {
+        return;
+    };
+    with_controller(handle, |controller| {
+        controller.start_receive_nearby(output_dir)
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn p2pshare_controller_set_device_name(handle: u64, name: *const c_char) {
+    let Some(name) = cstr_to_string(name) else {
+        return;
+    };
+    with_controller(handle, |controller| controller.set_device_name(name));
+}
+
+#[no_mangle]
+pub extern "C" fn p2pshare_controller_answer_offer(handle: u64, accept: bool) -> bool {
+    let mut answered = false;
+    with_controller(handle, |controller| {
+        answered = controller.answer_offer(accept)
+    });
+    answered
+}
+
+#[no_mangle]
+pub extern "C" fn p2pshare_controller_has_relay(handle: u64) -> bool {
+    let mut relay = false;
+    with_controller(handle, |controller| relay = controller.has_relay());
+    relay
+}
+
+#[no_mangle]
+pub extern "C" fn p2pshare_controller_rebind(handle: u64) {
+    with_controller(handle, TransferController::rebind);
+}
+
+#[no_mangle]
+pub extern "C" fn p2pshare_controller_start_browse(handle: u64) {
+    with_controller(handle, TransferController::start_browse);
+}
+
+#[no_mangle]
+pub extern "C" fn p2pshare_controller_stop_browse(handle: u64) {
+    with_controller(handle, TransferController::stop_browse);
+}
+
+#[no_mangle]
+pub extern "C" fn p2pshare_controller_poll_nearby_json(handle: u64) -> *mut c_char {
+    let mut out: Option<String> = None;
+    with_controller(handle, |controller| {
+        out = controller.poll_nearby_json();
+    });
+    match out {
+        Some(json) => CString::new(json)
+            .map(CString::into_raw)
+            .unwrap_or(std::ptr::null_mut()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn p2pshare_controller_poll_event_json(handle: u64) -> *mut c_char {
     let mut out: Option<String> = None;
     with_controller(handle, |controller| {
@@ -554,9 +781,12 @@ mod tests {
         });
         let controller = TransferController {
             runtime,
-            engine: Arc::new(OnceCell::new()),
+            engine: Mutex::new(Arc::new(OnceCell::new())),
+            device_name: Arc::new(Mutex::new(None)),
             queue: Arc::new(Mutex::new(EventQueue::default())),
             task: Mutex::new(Some(task)),
+            browse: Arc::new(Mutex::new(BrowseState::default())),
+            nearby: Arc::new(Mutex::new(VecDeque::new())),
         };
         p2pshare_controller_destroy(Box::into_raw(Box::new(controller)) as u64);
         receiver

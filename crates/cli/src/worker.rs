@@ -4,29 +4,47 @@ use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use p2p_share_core::nearby::Browser;
 use p2p_share_core::TransferEngine;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::{emit_json_line, StdoutJsonSink, TransferEventRecord};
+use crate::{emit_json_line, map_nearby, StdoutJsonSink, TransferEventRecord};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 enum WorkerCommand {
+    /// `nearby` is a `peer_id` from a `nearby_found` record of the active browse.
     Send {
         id: String,
         files: Vec<PathBuf>,
         to: Option<String>,
+        nearby: Option<String>,
     },
+    /// With `nearby`, the receiver is advertised and emits `offer` records.
     Receive {
         id: String,
         target: Option<String>,
         output: PathBuf,
+        #[serde(default)]
+        nearby: bool,
+    },
+    /// Reply to the active transfer's `offer`.
+    Answer {
+        id: String,
+        accept: bool,
     },
     Cancel {
         id: String,
+    },
+    /// Emit `nearby_found` / `nearby_lost` records until `stop_browse`.
+    Browse,
+    StopBrowse,
+    /// Name shown to nearby devices.
+    SetName {
+        name: String,
     },
     Shutdown,
 }
@@ -65,7 +83,7 @@ impl ActiveTransfer {
     }
 }
 
-pub async fn run() -> Result<()> {
+pub async fn run(name: Option<String>) -> Result<()> {
     // Tokio's stdin uses an uncancelable blocking read. A detached reader lets
     // explicit shutdown finish even when the parent still has stdin open.
     let (tx, mut commands) = mpsc::channel(16);
@@ -79,8 +97,12 @@ pub async fn run() -> Result<()> {
     });
 
     let engine = Arc::new(TransferEngine::bind().await?);
+    if let Some(name) = name {
+        engine.set_device_name(&name);
+    }
     emit_json_line(&TransferEventRecord::base("worker_ready"));
     let mut active: Option<ActiveTransfer> = None;
+    let mut browser: Option<Arc<Browser>> = None;
 
     loop {
         tokio::select! {
@@ -107,6 +129,18 @@ pub async fn run() -> Result<()> {
                 };
                 match command {
                     WorkerCommand::Shutdown => break,
+                    WorkerCommand::Browse => {
+                        browser.get_or_insert_with(|| {
+                            Arc::new(engine.browse_nearby(|event| emit_json_line(&map_nearby(event))))
+                        });
+                    }
+                    WorkerCommand::StopBrowse => browser = None,
+                    WorkerCommand::SetName { name } => engine.set_device_name(&name),
+                    WorkerCommand::Answer { id, accept } => {
+                        if active.as_ref().is_some_and(|transfer| transfer.id == id) {
+                            engine.answer_offer(accept);
+                        }
+                    }
                     WorkerCommand::Cancel { id } => {
                         if active.as_ref().is_some_and(|transfer| transfer.id == id) {
                             active.take().expect("active transfer checked").cancel().await;
@@ -132,10 +166,18 @@ pub async fn run() -> Result<()> {
                         }
                         let transfer_engine = engine.clone();
                         let transfer_sink = sink.clone();
+                        let peers = browser.clone();
                         sink.emit(TransferEventRecord::status("Transfer started."));
                         let task = tokio::spawn(async move {
                             match command {
+                                WorkerCommand::Send { files, nearby: Some(peer), .. } => {
+                                    let peer = peers
+                                        .and_then(|browser| browser.peer(&peer))
+                                        .ok_or_else(|| anyhow!("That device is no longer nearby."))?;
+                                    transfer_engine.send_nearby(&files, &peer, Some(transfer_sink)).await
+                                }
                                 WorkerCommand::Send { files, to, .. } => transfer_engine.send_paths(&files, to.as_deref(), Some(transfer_sink)).await,
+                                WorkerCommand::Receive { output, nearby: true, .. } => transfer_engine.receive_nearby(&output, Some(transfer_sink)).await,
                                 WorkerCommand::Receive { target, output, .. } => transfer_engine.receive(target.as_deref(), &output, Some(transfer_sink)).await,
                                 _ => unreachable!(),
                             }
@@ -150,6 +192,7 @@ pub async fn run() -> Result<()> {
     if let Some(transfer) = active.take() {
         transfer.cancel().await;
     }
+    drop(browser);
     engine.close().await;
     Ok(())
 }

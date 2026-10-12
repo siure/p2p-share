@@ -13,11 +13,12 @@ use crate::bundle;
 use crate::crypto;
 use crate::events::{TransferCompleted, TransferContentKind, TransferEvent};
 use crate::progress::transfer_progress_bar;
-use crate::protocol::{human_bytes, FileHeader, CHUNK_SIZE};
+use crate::protocol::{human_bytes, FileHeader, CHUNK_SIZE, OFFER_ACCEPT};
 use crate::ticket;
 
 use crate::engine::{
-    self, bounded, emit, status, Session, SharedSink, TransferEngine, ALPN, ALPN_REVERSE,
+    self, bounded, emit, status, Session, SharedSink, TransferEngine, ALPN, ALPN_NEARBY,
+    ALPN_REVERSE, OFFER_TIMEOUT,
 };
 
 #[derive(Debug, Clone)]
@@ -188,15 +189,19 @@ fn sent_success_message(prepared: &PreparedTransfer) -> String {
 }
 
 /// Send the file over an already-established encrypted channel.
-/// Used by both normal and reverse modes.
-async fn send_file<W>(
+/// Used by all modes. Nearby receivers pass `offer_reader` and the data only
+/// flows after they accept; `sender_name` is shown in their prompt.
+async fn send_file<W, R>(
     writer: &mut W,
+    offer_reader: Option<&mut R>,
     transport: &mut snow::TransportState,
     prepared: &PreparedTransfer,
+    sender_name: Option<&str>,
     sink: Option<&SharedSink>,
 ) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
 {
     let header = FileHeader {
         name: prepared.wire_name.clone(),
@@ -206,6 +211,7 @@ where
         item_count: Some(prepared.item_count),
         logical_name: (prepared.content_kind == TransferContentKind::Bundle)
             .then(|| prepared.logical_name.clone()),
+        sender_name: sender_name.map(str::to_owned),
     };
     let header_bytes = header.to_wire()?;
     bounded(
@@ -213,6 +219,20 @@ where
         crypto::encrypted_write(writer, transport, &header_bytes),
     )
     .await?;
+    if let Some(reader) = offer_reader {
+        status(sink, "Waiting for the receiver to accept...");
+        // A little longer than the receiver's own deadline, so its answer wins.
+        let verdict = tokio::time::timeout(
+            OFFER_TIMEOUT + std::time::Duration::from_secs(10),
+            crypto::encrypted_read(reader, transport),
+        )
+        .await
+        .context("The receiver did not answer in time.")?
+        .context("connection lost while waiting for the receiver to accept")?;
+        if verdict != OFFER_ACCEPT {
+            bail!("The receiver declined the transfer.");
+        }
+    }
 
     let transfer_label = if prepared.content_kind == TransferContentKind::Bundle {
         format!("Sending {} files...", prepared.item_count)
@@ -352,11 +372,15 @@ pub(crate) async fn send_on_endpoint(
     ep: &Endpoint,
     file_paths: &[PathBuf],
     target: Option<&str>,
+    sender_name: &str,
     sink: Option<SharedSink>,
 ) -> Result<()> {
     let target_addr = target
-        .map(|t| ticket::connection_target(t.trim(), ALPN_REVERSE))
+        .map(|t| ticket::connection_target(t.trim(), &[ALPN_REVERSE, ALPN_NEARBY]))
         .transpose()?;
+    let nearby = target_addr.as_ref().is_some_and(|(_, alpn)| {
+        std::str::from_utf8(alpn).is_ok_and(|alpn| ticket::session_matches(alpn, ALPN_NEARBY))
+    });
     // The shared endpoint is already probing paths while disk preparation runs.
     let prepared = prepare_send_paths(file_paths, sink.as_ref()).await?;
     status(sink.as_ref(), ready_to_send_message(&prepared));
@@ -365,7 +389,7 @@ pub(crate) async fn send_on_endpoint(
         status(sink.as_ref(), "Connecting to receiver...");
         bounded("connecting to receiver", ep.connect(addr, &session_alpn)).await?
     } else {
-        engine::accept_with_tickets(ep, ALPN, sink.as_ref()).await?
+        engine::accept_with_tickets(ep, ALPN, sink.as_ref(), &|_| {}).await?
     };
     let mut session = Session::new(conn, sink.clone());
     let conn = &session.conn;
@@ -388,7 +412,15 @@ pub(crate) async fn send_on_endpoint(
         format!("Encryption established. Verification code: {code}"),
     );
     emit(sink.as_ref(), TransferEvent::HandshakeCode(code));
-    send_file(&mut send_stream, &mut transport, &prepared, sink.as_ref()).await?;
+    send_file(
+        &mut send_stream,
+        nearby.then_some(&mut recv_stream),
+        &mut transport,
+        &prepared,
+        nearby.then_some(sender_name),
+        sink.as_ref(),
+    )
+    .await?;
     send_stream
         .finish()
         .context("failed to finish transfer stream")?;

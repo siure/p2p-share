@@ -34,6 +34,16 @@ pub struct TransferCompleted {
     pub item_count: u64,
 }
 
+/// A nearby sender asks to deliver files; answer with `TransferEngine::answer_offer`.
+#[derive(Debug, Clone)]
+pub struct TransferOffer {
+    pub sender_name: Option<String>,
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub content_kind: TransferContentKind,
+    pub item_count: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum TransferEvent {
     Status(String),
@@ -49,6 +59,9 @@ pub enum TransferEvent {
         latency_ms: Option<f64>,
     },
     Completed(TransferCompleted),
+    Offer(TransferOffer),
+    /// Nearby beacon (JSON) for platform Bluetooth advertisers; see `nearby::Beacon`.
+    Beacon(String),
     Error {
         code: String,
         message: String,
