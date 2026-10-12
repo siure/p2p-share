@@ -87,3 +87,22 @@ test("missing executable releases an in-flight transfer", { timeout: 5000 }, asy
   assert.equal(client.busy, false);
   assert.equal(events.filter((event) => event.kind === "error").length, 1);
 });
+
+test("forwards nearby records outside transfers and answers the active offer", { timeout: 5000 }, async (t) => {
+  const nearby = [];
+  const found = new EventEmitter();
+  const { client, wait } = setup(t, {
+    onNearby: (event) => { nearby.push(event); found.emit("found"); }
+  });
+  const seen = once(found, "found");
+  client.setBrowsing(true);
+  await seen;
+  assert.deepEqual(nearby, [{ kind: "nearby_found", peer_id: "peer", message: "Desk", lan: true }]);
+  assert.equal(client.answer(true), false, "no transfer, no offer to answer");
+  const started = wait("status");
+  client.start({ command: "receive", output: ".", nearby: true, to: "wait" });
+  await started;
+  const answered = wait("status");
+  assert.equal(client.answer(true), true);
+  assert.equal((await answered)[0].value, "answer:true");
+});

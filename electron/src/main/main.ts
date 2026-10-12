@@ -1,4 +1,5 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu } from "electron";
+import os from "node:os";
 import { spawn, execFile, type ChildProcessByStdio } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -9,7 +10,7 @@ import { WorkerClient, type WorkerTransfer } from "./worker-client";
 import { autoUpdater } from "electron-updater";
 import { Updates, isAppImageLaunch } from "./updates";
 
-import type { BuildInfo, StartTransferPayload, TransferEvent, TransferMode } from "../shared/ipc";
+import type { BuildInfo, NearbyEvent, StartTransferPayload, TransferEvent, TransferMode } from "../shared/ipc";
 import { evaluateSchemaCompatibility, TRANSFER_EVENT_SCHEMA_VERSION } from "../shared/schema";
 
 let mainWindow: BrowserWindow | null = null;
@@ -137,9 +138,15 @@ function isTransferMode(value: string): value is TransferMode {
   return (
     value === "send_wait" ||
     value === "send_to_ticket" ||
+    value === "send_nearby" ||
     value === "receive_target" ||
-    value === "receive_listen"
+    value === "receive_listen" ||
+    value === "receive_nearby"
   );
+}
+
+function isNearbyMode(mode: TransferMode): boolean {
+  return mode === "send_nearby" || mode === "receive_nearby";
 }
 
 function parseTransferPayload(payload: unknown): StartTransferPayload {
@@ -157,7 +164,8 @@ function parseTransferPayload(payload: unknown): StartTransferPayload {
     filePaths: stringArray(payload.filePaths),
     ticket: trimOrEmpty(payload.ticket),
     target: trimOrEmpty(payload.target),
-    outputDir: trimOrEmpty(payload.outputDir)
+    outputDir: trimOrEmpty(payload.outputDir),
+    peerId: trimOrEmpty(payload.peerId)
   };
 }
 
@@ -166,6 +174,13 @@ function emitTransferEvent(event: TransferEvent): void {
     return;
   }
   mainWindow.webContents.send("transfer:event", event);
+}
+
+function emitNearbyEvent(event: NearbyEvent): void {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+  mainWindow.webContents.send("nearby:event", event);
 }
 
 function existingFile(filePath: string): boolean {
@@ -345,24 +360,32 @@ async function prepareWorker(): Promise<WorkerClient | null> {
   if (quitting || !info.cli.capabilities.includes("worker")) return null;
   if (!worker) {
     const cli = resolveCliCommand();
-    worker = new WorkerClient({ ...cli, cwd: repoRoot(), onEvent: emitTransferEvent });
+    worker = new WorkerClient({
+      ...cli,
+      cwd: repoRoot(),
+      deviceName: os.hostname(),
+      onEvent: emitTransferEvent,
+      onNearby: emitNearbyEvent
+    });
   }
   worker.warmup();
   return worker;
 }
 
 function workerTransfer(payload: StartTransferPayload): WorkerTransfer {
-  if (payload.mode === "send_wait" || payload.mode === "send_to_ticket") {
+  if (payload.mode === "send_wait" || payload.mode === "send_to_ticket" || payload.mode === "send_nearby") {
     return {
       command: "send",
       files: stringArray(payload.filePaths),
-      ...(payload.mode === "send_to_ticket" ? { to: trimOrEmpty(payload.ticket) } : {})
+      ...(payload.mode === "send_to_ticket" ? { to: trimOrEmpty(payload.ticket) } : {}),
+      ...(payload.mode === "send_nearby" ? { nearby: trimOrEmpty(payload.peerId) } : {})
     };
   }
   return {
     command: "receive",
     output: trimOrEmpty(payload.outputDir),
-    ...(payload.mode === "receive_target" ? { target: trimOrEmpty(payload.target) } : {})
+    ...(payload.mode === "receive_target" ? { target: trimOrEmpty(payload.target) } : {}),
+    ...(payload.mode === "receive_nearby" ? { nearby: true } : {})
   };
 }
 
@@ -380,6 +403,8 @@ async function startTransfer(payload: StartTransferPayload): Promise<void> {
     }
     if (engine) {
       engine.start(workerTransfer(payload));
+    } else if (isNearbyMode(payload.mode)) {
+      throw new Error("Nearby sharing needs a newer transfer engine. Rebuild the CLI.");
     } else {
       startLegacyTransfer(payload);
     }
@@ -416,6 +441,16 @@ function buildTransferArgs(payload: StartTransferPayload): string[] {
         throw new Error("Output directory is required.");
       }
       return ["receive", "--qr", "--output", outputDir];
+    case "send_nearby":
+      if (filePaths.length === 0 || !trimOrEmpty(payload.peerId)) {
+        throw new Error("At least one file and a nearby device are required.");
+      }
+      return [];
+    case "receive_nearby":
+      if (!outputDir) {
+        throw new Error("Output directory is required.");
+      }
+      return [];
     default:
       throw new Error("Unsupported transfer mode.");
   }
@@ -705,6 +740,16 @@ ipcMain.handle("transfer:start", async (_event, payload: unknown) => {
 ipcMain.handle("transfer:cancel", async () => ({
   ok: cancelTransfer()
 }));
+
+ipcMain.handle("transfer:answer", async (_event, accept: unknown) => ({
+  ok: worker?.answer(accept === true) ?? false
+}));
+
+ipcMain.handle("nearby:browse", async (_event, on: unknown) => {
+  const engine = await prepareWorker();
+  engine?.setBrowsing(on === true);
+  return { ok: Boolean(engine) };
+});
 
 ipcMain.handle("updates:state", () => updates?.state ?? { status: "idle" });
 ipcMain.handle("updates:action", async () => {

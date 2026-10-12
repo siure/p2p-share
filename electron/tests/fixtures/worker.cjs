@@ -5,6 +5,14 @@ setTimeout(() => send({ kind: "worker_ready" }), 20);
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const command = JSON.parse(line);
   if (command.command === "shutdown") process.exit(0);
+  if (command.command === "browse") {
+    send({ kind: "nearby_found", peer_id: "peer", message: "Desk", lan: true });
+    return;
+  }
+  if (command.command === "answer") {
+    send({ kind: "status", transfer_id: command.id, value: `answer:${command.accept}` });
+    return;
+  }
   if (command.command === "cancel") {
     if (active?.to === "ignore-cancel") return;
     send({ kind: "process_end", transfer_id: command.id, value: "canceled" });

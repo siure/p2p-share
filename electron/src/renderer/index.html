@@ -82,6 +82,7 @@
               <button class="variant-btn" data-variant="send_to_ticket" type="button">
                 To ticket
               </button>
+              <button class="variant-btn" data-variant="send_nearby" type="button">Nearby</button>
             </div>
 
             <button id="dropZone" class="drop-zone" type="button">
@@ -103,6 +104,13 @@
               <span class="drop-zone-label">Drop files here or click to browse</span>
               <span id="fileName" class="drop-zone-file hidden"></span>
             </button>
+
+            <div id="nearbyField" class="field hidden">
+              <label class="field-label">Nearby devices</label>
+              <div id="nearbyList" class="nearby-list">
+                <span class="nearby-empty">Looking for devices...</span>
+              </div>
+            </div>
 
             <div id="sendTicketField" class="field hidden">
               <label class="field-label">Destination ticket</label>
@@ -130,6 +138,7 @@
               <button class="variant-btn" data-variant="receive_listen" type="button">
                 Listen for sender
               </button>
+              <button class="variant-btn" data-variant="receive_nearby" type="button">Nearby</button>
             </div>
 
             <div id="targetField" class="field">
@@ -199,6 +208,13 @@
               <span class="card-label">Verification</span>
               <span id="handshakeCode" class="card-value card-value--mono">- - - -</span>
             </div>
+          </div>
+
+          <!-- Nearby offer awaiting an answer -->
+          <div id="offerPrompt" class="offer hidden" role="alertdialog" aria-live="assertive">
+            <span id="offerText" class="offer-text"></span>
+            <button id="declineBtn" class="btn-ghost" type="button">Decline</button>
+            <button id="acceptBtn" class="btn-accept" type="button">Accept</button>
           </div>
 
           <!-- Progress -->
