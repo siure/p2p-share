@@ -184,6 +184,25 @@ where
         .with_context(|| format!("Failed while {phase}"))
 }
 
+/// Lines typed on the terminal. One reader thread outlives timed-out prompts,
+/// so a late answer is never consumed by an abandoned read.
+fn terminal_lines() -> &'static std::sync::Mutex<std::sync::mpsc::Receiver<String>> {
+    static LINES: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Receiver<String>>> =
+        std::sync::OnceLock::new();
+    LINES.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        std::sync::Mutex::new(rx)
+    })
+}
+
 /// Emit an offer and wait for `TransferEngine::answer_offer`. Without a sink
 /// (interactive CLI) the question is asked on the terminal instead.
 pub(crate) async fn ask_offer(
@@ -198,13 +217,22 @@ pub(crate) async fn ask_offer(
             offer.file_name,
             crate::protocol::human_bytes(offer.size_bytes)
         );
-        tokio::task::spawn_blocking(|| {
-            let mut line = String::new();
-            let _ = std::io::stdin().read_line(&mut line);
-            line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes")
+        // Same deadline as the event path, so an unanswered prompt declines and
+        // the receiver goes back to listening.
+        let answer = tokio::task::spawn_blocking(|| {
+            let lines = terminal_lines().lock().unwrap_or_else(|e| e.into_inner());
+            while lines.try_recv().is_ok() {} // drop input typed before the prompt
+            lines.recv_timeout(OFFER_TIMEOUT).ok()
         })
         .await
-        .unwrap_or(false)
+        .ok()
+        .flatten();
+        if answer.is_none() {
+            eprintln!("No answer; declined.");
+        }
+        answer.is_some_and(|line| {
+            line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes")
+        })
     } else {
         let (reply, answer) = tokio::sync::oneshot::channel();
         *engine.offer.lock().unwrap_or_else(|e| e.into_inner()) = Some(reply);

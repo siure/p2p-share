@@ -76,12 +76,13 @@ class BleAdvertiser(
     @Volatile private var beacon = ByteArray(0)
     @Volatile private var hotspot = ByteArray(0)
     private var server: BluetoothGattServer? = null
+    private var advertising = false
     private val advertiseCallback = object : AdvertiseCallback() {}
 
     /** Returns false when Bluetooth is off or unsupported. */
     fun start(): Boolean {
         val adapter = bluetooth(context) ?: return false
-        val advertiser = adapter.bluetoothLeAdvertiser ?: return false
+        if (adapter.bluetoothLeAdvertiser == null) return false
         val manager = context.getSystemService(BluetoothManager::class.java)
         val gatt = manager.openGattServer(context, serverCallback) ?: return false
         val service = BluetoothGattService(NearbyUuids.SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY)
@@ -94,7 +95,15 @@ class BleAdvertiser(
         service.addCharacteristic(BluetoothGattCharacteristic(NearbyUuids.JOIN, write, writePerm))
         gatt.addService(service)
         server = gatt
-        advertiser.startAdvertising(
+        return true
+    }
+
+    /** The first beacon starts advertising, so scanners never read an empty value. */
+    fun updateBeacon(json: String) {
+        beacon = json.toByteArray(Charsets.UTF_8)
+        if (advertising || server == null) return
+        advertising = true
+        bluetooth(context)?.bluetoothLeAdvertiser?.startAdvertising(
             AdvertiseSettings.Builder()
                 .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
                 .setConnectable(true)
@@ -102,11 +111,6 @@ class BleAdvertiser(
             AdvertiseData.Builder().addServiceUuid(ParcelUuid(NearbyUuids.SERVICE)).build(),
             advertiseCallback,
         )
-        return true
-    }
-
-    fun updateBeacon(json: String) {
-        beacon = json.toByteArray(Charsets.UTF_8)
     }
 
     fun setHotspot(credentials: HotspotCredentials?) {
@@ -117,6 +121,7 @@ class BleAdvertiser(
         runCatching { bluetooth(context)?.bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback) }
         runCatching { server?.close() }
         server = null
+        advertising = false
     }
 
     private val serverCallback = object : BluetoothGattServerCallback() {

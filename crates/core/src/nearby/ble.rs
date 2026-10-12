@@ -36,8 +36,10 @@ async fn adapter() -> Result<Adapter> {
 }
 
 pub(super) struct Advertiser {
+    adapter: Adapter,
     beacon: Arc<Mutex<Vec<u8>>>,
-    _advertisement: AdvertisementHandle,
+    /// Started with the first beacon, so scanners never read an empty value.
+    advertisement: Arc<tokio::sync::OnceCell<AdvertisementHandle>>,
     _application: ApplicationHandle,
     /// Hotspot joined at a sender's request; left when the receiver stops.
     _joined: Arc<tokio::sync::Mutex<Option<hotspot::Joined>>>,
@@ -118,16 +120,10 @@ impl Advertiser {
             ..Default::default()
         };
         let application = adapter.serve_gatt_application(application).await?;
-        let advertisement = adapter
-            .advertise(Advertisement {
-                service_uuids: [uuid(BLE_SERVICE_UUID)].into(),
-                discoverable: Some(true),
-                ..Default::default()
-            })
-            .await?;
         Ok(Self {
+            adapter,
             beacon,
-            _advertisement: advertisement,
+            advertisement: Arc::new(tokio::sync::OnceCell::new()),
             _application: application,
             _joined: joined,
         })
@@ -135,6 +131,22 @@ impl Advertiser {
 
     pub(super) fn update(&self, beacon: &Beacon) {
         *self.beacon.lock().unwrap_or_else(|e| e.into_inner()) = beacon.to_json().into_bytes();
+        if self.advertisement.initialized() {
+            return;
+        }
+        let (adapter, advertisement) = (self.adapter.clone(), self.advertisement.clone());
+        // The handle stops advertising when the last reference (ours) is dropped.
+        tokio::spawn(async move {
+            let _ = advertisement
+                .get_or_try_init(|| {
+                    adapter.advertise(Advertisement {
+                        service_uuids: [uuid(BLE_SERVICE_UUID)].into(),
+                        discoverable: Some(true),
+                        ..Default::default()
+                    })
+                })
+                .await;
+        });
     }
 }
 
@@ -163,7 +175,7 @@ pub(super) async fn browse(table: SharedTable) {
                 if !advertises_service(&adapter, address).await {
                     continue;
                 }
-                if let Ok(beacon) = read_beacon(&adapter, address).await {
+                if let Some(beacon) = read_beacon_retrying(&adapter, address).await {
                     if let Ok(id) = ticket::peer_id(&beacon.ticket) {
                         ids.insert(address, id);
                         let via = Via::Bluetooth(address.to_string());
@@ -219,6 +231,17 @@ async fn with_characteristic<T>(
     .context("Bluetooth request timed out");
     let _ = device.disconnect().await;
     result?
+}
+
+/// `DeviceAdded` fires once per device, so ride out transient GATT failures here.
+async fn read_beacon_retrying(adapter: &Adapter, address: Address) -> Option<Beacon> {
+    for _ in 0..3 {
+        if let Ok(beacon) = read_beacon(adapter, address).await {
+            return Some(beacon);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    None
 }
 
 async fn read_beacon(adapter: &Adapter, address: Address) -> Result<Beacon> {

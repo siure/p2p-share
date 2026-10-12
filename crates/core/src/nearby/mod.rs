@@ -104,7 +104,7 @@ pub enum NearbyEvent {
 }
 
 /// Cut `text` to at most `max` bytes without splitting a character.
-fn truncate(text: &str, max: usize) -> String {
+pub(super) fn truncate(text: &str, max: usize) -> String {
     let mut end = text.len().min(max);
     while !text.is_char_boundary(end) {
         end -= 1;

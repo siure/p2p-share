@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use anyhow::Result;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 
-use super::{lock, SharedTable, Via};
+use super::{lock, truncate, SharedTable, Via};
 use crate::ticket;
 
 pub(super) const SERVICE_TYPE: &str = "_p2psh._udp.local.";
@@ -33,8 +33,9 @@ impl Advertiser {
             return;
         };
         let short = &id[..12.min(id.len())];
-        // Instance labels are limited to 63 bytes; the id suffix keeps them unique.
-        let label: String = name.chars().take(40).collect();
+        // Instance labels are limited to 63 bytes, including the " <id>" suffix
+        // that keeps them unique; leave room for escaped characters too.
+        let label = truncate(name.trim(), 40);
         let mut properties = vec![
             ("v".to_string(), "1".to_string()),
             ("n".to_string(), label.clone()),

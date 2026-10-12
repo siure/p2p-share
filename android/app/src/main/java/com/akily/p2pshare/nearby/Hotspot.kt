@@ -27,8 +27,13 @@ class HotspotHost(private val context: Context) {
             suspendCancellableCoroutine { continuation ->
                 val callback = object : WifiManager.LocalOnlyHotspotCallback() {
                     override fun onStarted(started: WifiManager.LocalOnlyHotspotReservation) {
+                        // Started after a cancel or timeout: nobody will stop it later.
+                        if (!continuation.isActive) {
+                            runCatching { started.close() }
+                            return
+                        }
                         reservation = started
-                        if (continuation.isActive) continuation.resume(credentials(started))
+                        continuation.resume(credentials(started))
                     }
 
                     override fun onFailed(reason: Int) {
