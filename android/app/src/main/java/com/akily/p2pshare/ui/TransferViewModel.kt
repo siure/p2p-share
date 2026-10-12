@@ -12,12 +12,16 @@ import androidx.lifecycle.viewModelScope
 import com.akily.p2pshare.bridge.BridgeEvent
 import com.akily.p2pshare.bridge.TransferEngine
 import com.akily.p2pshare.bridge.TransferEngineFactory
+import com.akily.p2pshare.model.OfferUi
 import com.akily.p2pshare.model.ReceiveFormState
+import com.akily.p2pshare.model.ReceiveMode
 import com.akily.p2pshare.model.SendFormState
+import com.akily.p2pshare.model.SendMode
 import com.akily.p2pshare.model.TransferHistoryEntry
 import com.akily.p2pshare.model.TransferStage
 import com.akily.p2pshare.model.TransferTab
 import com.akily.p2pshare.model.TransferUiState
+import com.akily.p2pshare.nearby.NearbyManager
 import com.akily.p2pshare.storage.FilePrep
 import com.akily.p2pshare.storage.PrefsStore
 import kotlinx.coroutines.CancellationException
@@ -34,6 +38,8 @@ import java.io.File
 class TransferViewModel(app: Application) : AndroidViewModel(app) {
     private val engine: TransferEngine = TransferEngineFactory.create(app)
     private val prefs = PrefsStore(app)
+    val nearby = NearbyManager(app, viewModelScope, engine)
+    private var reachJob: Job? = null
     private val readyStatus = "Ready"
 
     var selectedTab by mutableStateOf(TransferTab.SEND)
@@ -70,18 +76,39 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
 
     fun selectTab(tab: TransferTab) {
         selectedTab = tab
+        updateBrowsing()
     }
 
-    fun setSendMode(sendToTicket: Boolean) {
-        sendForm = sendForm.copy(sendToTicketMode = sendToTicket)
+    /** Callers request the nearby permissions before choosing [SendMode.NEARBY]. */
+    fun setSendMode(mode: SendMode) {
+        sendForm = sendForm.copy(sendMode = mode)
+        updateBrowsing()
+    }
+
+    fun selectPeer(id: String) {
+        sendForm = sendForm.copy(selectedPeerId = id)
+    }
+
+    /** Browse only while the nearby send list is on screen. */
+    private fun updateBrowsing() {
+        if (selectedTab == TransferTab.SEND && sendForm.sendMode == SendMode.NEARBY) {
+            nearby.startBrowsing()
+        } else {
+            nearby.stopBrowsing()
+        }
+    }
+
+    fun answerOffer(accept: Boolean) {
+        engine.answerOffer(accept)
+        receiveUi = receiveUi.copy(offer = null)
     }
 
     fun setTicketInput(ticket: String) {
         sendForm = sendForm.copy(ticketInput = ticket)
     }
 
-    fun setReceiveMode(connectMode: Boolean) {
-        receiveForm = receiveForm.copy(connectMode = connectMode)
+    fun setReceiveMode(mode: ReceiveMode) {
+        receiveForm = receiveForm.copy(receiveMode = mode)
     }
 
     fun setTargetInput(target: String) {
@@ -158,7 +185,9 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         preparationJob?.cancel()
+        reachJob?.cancel()
         stopPolling()
+        nearby.close()
         engine.close()
         activeSendPaths = emptySet()
         releaseUnusedPreparedFiles(emptySet())
@@ -196,15 +225,38 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
 
+        val peer = nearby.peers.find { it.id == sendForm.selectedPeerId }
+        if (sendForm.sendMode == SendMode.NEARBY && peer == null) {
+            sendUi = sendUi.copy(stage = TransferStage.FAILED, statusLine = "Choose a nearby device.")
+            return
+        }
+
         activeSendPaths = paths.toSet()
         resetSendUi()
         activeDirection = "send"
         sendUi = sendUi.copy(stage = TransferStage.PREPARING, statusLine = "Starting send...")
 
-        if (sendForm.sendToTicketMode) {
-            engine.startSendToTicket(paths, sendForm.ticketInput.trim())
-        } else {
-            engine.startSendWait(paths)
+        when (sendForm.sendMode) {
+            SendMode.TICKET -> engine.startSendToTicket(paths, sendForm.ticketInput.trim())
+            SendMode.WAIT -> engine.startSendWait(paths)
+            SendMode.NEARBY -> {
+                reachJob = viewModelScope.launch {
+                    val ticket = try {
+                        nearby.reach(requireNotNull(peer)) { sendUi = sendUi.copy(statusLine = it) }
+                    } catch (err: CancellationException) {
+                        throw err
+                    } catch (err: Exception) {
+                        nearby.releaseNetwork()
+                        finishSendOwnership()
+                        sendUi = sendUi.copy(stage = TransferStage.FAILED, statusLine = "Transfer failed",
+                            errorMessage = err.message)
+                        return@launch
+                    }
+                    engine.startSendToTicket(paths, ticket)
+                    startPolling()
+                }
+                return
+            }
         }
 
         startPolling()
@@ -218,10 +270,15 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
         activeDirection = "receive"
         receiveUi = receiveUi.copy(stage = TransferStage.PREPARING, statusLine = "Starting receive...")
 
-        if (receiveForm.connectMode) {
-            engine.startReceiveTarget(receiveForm.targetInput.trim(), outputDir.absolutePath)
-        } else {
-            engine.startReceiveListen(outputDir.absolutePath)
+        when (receiveForm.receiveMode) {
+            ReceiveMode.CONNECT -> engine.startReceiveTarget(receiveForm.targetInput.trim(), outputDir.absolutePath)
+            ReceiveMode.LISTEN -> engine.startReceiveListen(outputDir.absolutePath)
+            ReceiveMode.NEARBY -> {
+                engine.startReceiveNearby(outputDir.absolutePath)
+                if (!nearby.startAdvertising { receiveUi = receiveUi.copy(statusLine = it) }) {
+                    receiveUi = receiveUi.copy(statusLine = "Bluetooth unavailable: visible on this network only.")
+                }
+            }
         }
 
         startPolling()
@@ -229,7 +286,9 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
 
     fun cancelTransfer() {
         if (activeDirection == "send") preparationJob?.cancel()
+        reachJob?.cancel()
         engine.cancel()
+        endNearbySession()
         finishSendOwnership()
         stopPolling()
         updateActiveUi {
@@ -240,8 +299,14 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
                 qrPayload = null,
                 progressDone = 0,
                 progressTotal = 0,
+                offer = null,
             )
         }
+    }
+
+    /** Stop advertising or leave a hotspot joined for this transfer. */
+    private fun endNearbySession() {
+        if (activeDirection == "receive") nearby.stopAdvertising() else nearby.releaseNetwork()
     }
 
     fun isBusy(): Boolean = listOf(sendUi, receiveUi).any {
@@ -318,7 +383,9 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
                     event.message?.contains("connected", ignoreCase = true) == true -> TransferStage.VERIFYING
                     else -> current.stage
                 }
-                setCurrentUi(current.copy(statusLine = event.message ?: current.statusLine, stage = stage))
+                // The engine declines on its own when an offer goes unanswered.
+                val offer = current.offer.takeUnless { event.message?.startsWith("Declined") == true }
+                setCurrentUi(current.copy(statusLine = event.message ?: current.statusLine, stage = stage, offer = offer))
                 return false
             }
 
@@ -329,6 +396,22 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
 
             "qr_payload" -> {
                 setCurrentUi(current.copy(qrPayload = event.value))
+                return false
+            }
+
+            "beacon" -> {
+                event.value?.let(nearby::updateBeacon)
+                return false
+            }
+
+            "offer" -> {
+                val offer = OfferUi(
+                    senderName = event.message ?: "A nearby device",
+                    fileName = event.fileName ?: "files",
+                    sizeBytes = event.sizeBytes ?: 0,
+                    itemCount = event.itemCount ?: 1,
+                )
+                setCurrentUi(current.copy(offer = offer))
                 return false
             }
 
@@ -360,6 +443,7 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
 
             "completed" -> {
                 if (activeDirection == "send") finishSendOwnership()
+                endNearbySession()
                 var finalPath = event.savedPath
                 val outputTree = receiveForm.outputTreeUri
                 if (activeDirection == "receive" && finalPath != null && outputTree != null) {
@@ -387,6 +471,7 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
 
             "error" -> {
                 if (activeDirection == "send") finishSendOwnership()
+                endNearbySession()
                 setCurrentUi(
                     current.copy(
                         stage = TransferStage.FAILED,

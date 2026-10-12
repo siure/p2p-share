@@ -17,6 +17,9 @@ data class BridgeEvent(
     val itemCount: Long? = null,
 )
 
+/** A receiver found over mDNS by the native engine; `ticket` is null when lost. */
+data class NearbyRecord(val peerId: String, val name: String?, val ticket: String?)
+
 interface TransferEngine {
     val usingRust: Boolean
 
@@ -24,6 +27,16 @@ interface TransferEngine {
     fun startSendToTicket(filePaths: List<String>, ticket: String)
     fun startReceiveTarget(target: String, outputDir: String)
     fun startReceiveListen(outputDir: String)
+    /** Listen while advertised over mDNS; emits `beacon` and `offer` events. */
+    fun startReceiveNearby(outputDir: String)
+    fun answerOffer(accept: Boolean): Boolean
+    fun setDeviceName(name: String)
+    fun hasRelay(): Boolean
+    /** Recreate the endpoint after the process switched networks. Cancels any transfer. */
+    fun rebind()
+    fun startBrowse()
+    fun stopBrowse()
+    fun pollNearby(): NearbyRecord?
     fun pollEvent(): BridgeEvent?
     fun cancel()
     fun close() = cancel()
@@ -50,6 +63,18 @@ class DemoTransferEngine : TransferEngine {
     override fun startReceiveListen(outputDir: String) {
         runDemo("receive", withTicket = true, outputDir = outputDir)
     }
+
+    override fun startReceiveNearby(outputDir: String) {
+        runDemo("receive", withTicket = true, outputDir = outputDir)
+    }
+
+    override fun answerOffer(accept: Boolean): Boolean = false
+    override fun setDeviceName(name: String) = Unit
+    override fun hasRelay(): Boolean = false
+    override fun rebind() = Unit
+    override fun startBrowse() = Unit
+    override fun stopBrowse() = Unit
+    override fun pollNearby(): NearbyRecord? = null
 
     override fun pollEvent(): BridgeEvent? = queue.poll()
 

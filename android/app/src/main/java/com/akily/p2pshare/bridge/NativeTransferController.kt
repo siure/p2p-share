@@ -34,6 +34,54 @@ class NativeTransferController private constructor(
     }
 
     @Synchronized
+    override fun startReceiveNearby(outputDir: String) {
+        if (handle == 0L) return
+        RustBindings.nativeStartReceiveNearby(handle, outputDir)
+    }
+
+    @Synchronized
+    override fun answerOffer(accept: Boolean): Boolean =
+        handle != 0L && RustBindings.nativeAnswerOffer(handle, accept)
+
+    @Synchronized
+    override fun setDeviceName(name: String) {
+        if (handle == 0L) return
+        RustBindings.nativeSetDeviceName(handle, name)
+    }
+
+    @Synchronized
+    override fun hasRelay(): Boolean = handle != 0L && RustBindings.nativeHasRelay(handle)
+
+    @Synchronized
+    override fun rebind() {
+        if (handle == 0L) return
+        RustBindings.nativeRebind(handle)
+    }
+
+    @Synchronized
+    override fun startBrowse() {
+        if (handle == 0L) return
+        RustBindings.nativeStartBrowse(handle)
+    }
+
+    @Synchronized
+    override fun stopBrowse() {
+        if (handle == 0L) return
+        RustBindings.nativeStopBrowse(handle)
+    }
+
+    @Synchronized
+    override fun pollNearby(): NearbyRecord? {
+        if (handle == 0L) return null
+        val json = JSONObject(RustBindings.nativePollNearby(handle) ?: return null)
+        return NearbyRecord(
+            peerId = json.optString("peer_id"),
+            name = json.optNullableString("name"),
+            ticket = json.optNullableString("ticket"),
+        )
+    }
+
+    @Synchronized
     override fun pollEvent(): BridgeEvent? {
         if (handle == 0L) return null
         val payload = RustBindings.nativePollEvent(handle) ?: return null
