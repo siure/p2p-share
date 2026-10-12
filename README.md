@@ -25,6 +25,21 @@ cargo run -p p2p-share -- send ./file.txt ./photo.jpg ./notes.pdf
 cargo run -p p2p-share -- receive p2psh:... --output .
 ```
 
+Nearby sharing (no ticket to copy):
+
+```bash
+cargo run -p p2p-share -- --name Desk receive --nearby --output .   # visible, asks before accepting
+cargo run -p p2p-share -- nearby                                     # list receivers nearby
+cargo run -p p2p-share -- send ./photo.jpg --nearby Desk
+```
+
+Receivers advertise their session ticket over mDNS on the local network and
+over Bluetooth LE (Linux through BlueZ, Android). Senders that only see a
+receiver over Bluetooth use the relay when both devices have internet;
+otherwise an Android device starts a local-only hotspot and the other device
+joins it (Linux through NetworkManager). Windows supports mDNS only. Linux
+builds need `libdbus-1-dev` and `pkg-config`.
+
 Build Android app:
 
 ```bash
