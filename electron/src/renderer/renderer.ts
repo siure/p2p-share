@@ -1,4 +1,12 @@
-import type { BuildInfo, P2PShareApi, StartTransferPayload, TransferEvent, UpdateState } from "../shared/ipc";
+import type {
+  BuildInfo,
+  NearbyEvent,
+  TransferEventOffer,
+  P2PShareApi,
+  StartTransferPayload,
+  TransferEvent,
+  UpdateState
+} from "../shared/ipc";
 import { evaluateSchemaCompatibility, TRANSFER_EVENT_SCHEMA_VERSION } from "../shared/schema";
 
 const api: P2PShareApi | undefined = window.p2pShareApi;
@@ -30,6 +38,12 @@ const receiveConfig = $("receiveConfig");
 const dropZone = $<HTMLButtonElement>("dropZone");
 const fileNameEl = $("fileName");
 const sendTicketField = $("sendTicketField");
+const nearbyField = $("nearbyField");
+const nearbyList = $("nearbyList");
+const offerPrompt = $("offerPrompt");
+const offerText = $("offerText");
+const acceptBtn = $<HTMLButtonElement>("acceptBtn");
+const declineBtn = $<HTMLButtonElement>("declineBtn");
 const sendTicketInput = $<HTMLInputElement>("sendTicketInput");
 const targetField = $("targetField");
 const targetInput = $<HTMLInputElement>("targetInput");
@@ -89,6 +103,9 @@ updateButton.addEventListener("click", () => {
 let mode: UiMode = "send";
 let subMode: TransferMode = "send_wait";
 let selectedFiles: SelectedFile[] = [];
+const nearbyPeers = new Map<string, NearbyEvent>();
+let selectedPeerId = "";
+let browsing = false;
 let isRunning = false;
 let currentTicket = "";
 let ticketRequest = 0;
@@ -144,8 +161,10 @@ function isTransferMode(value: string): value is TransferMode {
   return (
     value === "send_wait" ||
     value === "send_to_ticket" ||
+    value === "send_nearby" ||
     value === "receive_target" ||
-    value === "receive_listen"
+    value === "receive_listen" ||
+    value === "receive_nearby"
   );
 }
 
@@ -232,6 +251,70 @@ function setSubMode(newSubMode: TransferMode): void {
   } else {
     targetField.classList.toggle("hidden", subMode !== "receive_target");
   }
+  nearbyField.classList.toggle("hidden", subMode !== "send_nearby");
+  setBrowsing(subMode === "send_nearby");
+}
+
+/** Discovery runs only while the nearby device list is shown. */
+function setBrowsing(on: boolean): void {
+  if (on === browsing) return;
+  browsing = on;
+  if (!on) {
+    nearbyPeers.clear();
+    renderNearby();
+  }
+  void api?.setBrowsing(on).catch((err) => pushLog(`Nearby: ${errorMessage(err)}`));
+}
+
+function handleNearbyEvent(event: NearbyEvent): void {
+  if (!browsing) return;
+  if (event.kind === "nearby_found") nearbyPeers.set(event.peer_id, event);
+  else nearbyPeers.delete(event.peer_id);
+  renderNearby();
+}
+
+function renderNearby(): void {
+  const peers = [...nearbyPeers.values()].sort((a, b) => (a.message ?? "").localeCompare(b.message ?? ""));
+  if (!nearbyPeers.has(selectedPeerId)) selectedPeerId = peers.length === 1 ? peers[0].peer_id : "";
+  if (peers.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "nearby-empty";
+    empty.textContent = "Looking for devices...";
+    nearbyList.replaceChildren(empty);
+    return;
+  }
+  nearbyList.replaceChildren(
+    ...peers.map((peer) => {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = `nearby-peer${peer.peer_id === selectedPeerId ? " nearby-peer--selected" : ""}`;
+      const name = document.createElement("span");
+      name.textContent = peer.message || "Unknown device";
+      const via = document.createElement("span");
+      via.className = "nearby-via";
+      via.textContent = [peer.lan && "LAN", peer.bluetooth && "BT"].filter(Boolean).join(" + ");
+      row.append(name, via);
+      row.addEventListener("click", () => {
+        selectedPeerId = peer.peer_id;
+        renderNearby();
+      });
+      return row;
+    })
+  );
+}
+
+function showOffer(evt: TransferEventOffer): void {
+  const items = typeof evt.item_count === "number" ? evt.item_count : 1;
+  const what = items > 1 ? `${items} files` : typeof evt.file_name === "string" ? evt.file_name : "a file";
+  const from = typeof evt.message === "string" && evt.message ? evt.message : "A nearby device";
+  const size = typeof evt.size_bytes === "number" ? ` (${formatBytes(evt.size_bytes)})` : "";
+  offerText.textContent = `${from} wants to send ${what}${size}.`;
+  offerPrompt.classList.remove("hidden");
+}
+
+function answerOffer(accept: boolean): void {
+  offerPrompt.classList.add("hidden");
+  void api?.answerOffer(accept).catch((err) => pushLog(`Answer failed: ${errorMessage(err)}`));
 }
 
 function updateDropZoneLabel(text: string): void {
@@ -295,6 +378,7 @@ function switchToTransfer(): void {
   progressDetail.textContent = "";
   progressFill.style.width = "0%";
   shareArea.classList.add("hidden");
+  offerPrompt.classList.add("hidden");
   completeSummary.classList.add("hidden");
   errorSummary.classList.add("hidden");
   newTransferBtn.classList.add("hidden");
@@ -323,7 +407,8 @@ function buildPayload(): StartTransferPayload {
     filePaths: selectedFiles.map((file) => file.path),
     ticket: sendTicketInput.value.trim(),
     target: targetInput.value.trim(),
-    outputDir: outputDir.value.trim() || "."
+    outputDir: outputDir.value.trim() || ".",
+    peerId: selectedPeerId
   };
 }
 
@@ -332,9 +417,14 @@ async function startTransfer(): Promise<void> {
   const desktopApi = getApi();
   if (!desktopApi) return;
 
-  if ((subMode === "send_wait" || subMode === "send_to_ticket") && selectedFiles.length === 0) {
+  if (mode === "send" && selectedFiles.length === 0) {
     flash(dropZone);
     pushLog("Please select one or more files to send.");
+    return;
+  }
+  if (subMode === "send_nearby" && !selectedPeerId) {
+    flash(nearbyList);
+    pushLog("Please choose a nearby device.");
     return;
   }
   if (subMode === "send_to_ticket" && !sendTicketInput.value.trim()) {
@@ -405,6 +495,10 @@ function summarizeEvent(evt: TransferEvent): string {
       return "Ticket generated";
     case "qr_payload":
       return "QR payload ready";
+    case "beacon":
+      return "Nearby beacon updated";
+    case "offer":
+      return `Offer from ${typeof evt.message === "string" ? evt.message : "a nearby device"}`;
     case "handshake_code":
       return `Handshake: ${typeof evt.value === "string" ? evt.value : "n/a"}`;
     case "progress": {
@@ -453,11 +547,17 @@ function handleTransferEvent(evt: TransferEvent): void {
   switch (evt.kind) {
     case "status":
       statusText.textContent = typeof evt.message === "string" ? evt.message : "Working...";
+      // The engine declines on its own when an offer goes unanswered.
+      if (evt.message?.startsWith("Declined")) offerPrompt.classList.add("hidden");
       break;
 
     case "ticket":
     case "qr_payload":
       void setTicketVisual(typeof evt.value === "string" ? evt.value : "");
+      break;
+
+    case "offer":
+      showOffer(evt as TransferEventOffer);
       break;
 
     case "handshake_code":
@@ -517,6 +617,7 @@ function handleTransferEvent(evt: TransferEvent): void {
       break;
 
     case "process_end":
+      offerPrompt.classList.add("hidden");
       isRunning = false;
       renderUpdate();
       if (evt.value === "canceled") {
@@ -626,6 +727,8 @@ cancelBtn.addEventListener("click", async () => {
 });
 
 newTransferBtn.addEventListener("click", switchToConfig);
+acceptBtn.addEventListener("click", () => answerOffer(true));
+declineBtn.addEventListener("click", () => answerOffer(false));
 
 copyBtn.addEventListener("click", async () => {
   const desktopApi = getApi();
@@ -695,6 +798,7 @@ function init(): void {
   }
 
   desktopApi.onTransferEvent(handleTransferEvent);
+  desktopApi.onNearbyEvent(handleNearbyEvent);
   desktopApi.onUpdateState(renderUpdate);
   void desktopApi.getUpdateState().then(renderUpdate).catch(() => {});
   desktopApi

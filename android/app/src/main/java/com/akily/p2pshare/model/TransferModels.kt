@@ -28,6 +28,18 @@ data class TransferHistoryEntry(
     val detail: String,
 )
 
+enum class SendMode { WAIT, TICKET, NEARBY }
+
+enum class ReceiveMode { CONNECT, LISTEN, NEARBY }
+
+/** A nearby sender waiting for this device to accept. */
+data class OfferUi(
+    val senderName: String,
+    val fileName: String,
+    val sizeBytes: Long,
+    val itemCount: Long,
+)
+
 data class TransferUiState(
     val stage: TransferStage = TransferStage.IDLE,
     val statusLine: String = "Ready",
@@ -44,17 +56,19 @@ data class TransferUiState(
     val completedContentKind: String? = null,
     val completedItemCount: Long = 1,
     val errorMessage: String? = null,
+    val offer: OfferUi? = null,
 )
 
 data class SendFormState(
     val fileUris: List<Uri> = emptyList(),
     val preparedPaths: List<String> = emptyList(),
-    val sendToTicketMode: Boolean = false,
+    val sendMode: SendMode = SendMode.WAIT,
     val ticketInput: String = "",
+    val selectedPeerId: String? = null,
 )
 
 data class ReceiveFormState(
-    val connectMode: Boolean = true,
+    val receiveMode: ReceiveMode = ReceiveMode.CONNECT,
     val targetInput: String = "",
     val outputTreeUri: Uri? = null,
 )

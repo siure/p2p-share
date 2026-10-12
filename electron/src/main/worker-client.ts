@@ -2,18 +2,21 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import readline from "node:readline";
 
-import type { TransferEvent } from "../shared/ipc";
+import type { NearbyEvent, TransferEvent } from "../shared/ipc";
 import { TRANSFER_EVENT_SCHEMA_VERSION } from "../shared/schema";
 
 export type WorkerTransfer =
-  | { command: "send"; files: string[]; to?: string }
-  | { command: "receive"; target?: string; output: string };
+  | { command: "send"; files: string[]; to?: string; nearby?: string }
+  | { command: "receive"; target?: string; output: string; nearby?: boolean };
 
 interface WorkerOptions {
   command: string;
   argsPrefix: string[];
   cwd: string;
+  /** Name shown to nearby devices. */
+  deviceName?: string;
   onEvent: (event: TransferEvent) => void;
+  onNearby?: (event: NearbyEvent) => void;
   startupTimeoutMs?: number;
   stopTimeoutMs?: number;
 }
@@ -25,6 +28,7 @@ export class WorkerClient {
   private startupTimer: NodeJS.Timeout | null = null;
   private cancelTimer: NodeJS.Timeout | null = null;
   private closing = false;
+  private browsing = false;
 
   constructor(private readonly options: WorkerOptions) {}
 
@@ -34,7 +38,8 @@ export class WorkerClient {
 
   warmup(): void {
     if (this.child || this.closing) return;
-    const child = spawn(this.options.command, [...this.options.argsPrefix, "--json", "worker"], {
+    const name = this.options.deviceName ? ["--name", this.options.deviceName] : [];
+    const child = spawn(this.options.command, [...this.options.argsPrefix, "--json", ...name, "worker"], {
       cwd: this.options.cwd,
       stdio: ["pipe", "pipe", "pipe"]
     });
@@ -61,6 +66,10 @@ export class WorkerClient {
         this.clearStartupTimer();
         return;
       }
+      if (event.kind === "nearby_found" || event.kind === "nearby_lost") {
+        this.options.onNearby?.(event as unknown as NearbyEvent);
+        return;
+      }
       if (!this.active || event.transfer_id !== this.active.id) return;
       if (event.kind === "process_end") {
         this.clearCancelTimer();
@@ -82,6 +91,8 @@ export class WorkerClient {
       lines.close();
       if (this.child !== child) return;
       this.child = null;
+      // The next process starts without a browse; ask for it again.
+      if (this.browsing && !this.closing) queueMicrotask(() => this.setBrowsing(true));
       this.clearStartupTimer();
       this.clearCancelTimer();
       const active = this.active;
@@ -111,6 +122,21 @@ export class WorkerClient {
     const id = randomUUID();
     this.active = { id, canceled: false };
     this.child!.stdin.write(`${JSON.stringify({ id, ...transfer })}\n`);
+  }
+
+  /** Discovery runs alongside transfers until turned off. */
+  setBrowsing(on: boolean): void {
+    if (this.closing) return;
+    this.browsing = on;
+    if (on) this.warmup();
+    this.child?.stdin.write(`${JSON.stringify({ command: on ? "browse" : "stop_browse" })}\n`);
+  }
+
+  /** Accept or decline the active transfer's `offer`. */
+  answer(accept: boolean): boolean {
+    if (!this.active || !this.child) return false;
+    this.child.stdin.write(`${JSON.stringify({ id: this.active.id, command: "answer", accept })}\n`);
+    return true;
   }
 
   cancel(): boolean {

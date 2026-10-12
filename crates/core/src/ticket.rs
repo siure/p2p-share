@@ -42,22 +42,74 @@ pub fn deserialize(ticket: &str) -> Result<EndpointAddr> {
     Ok(decode(ticket)?.endpoint)
 }
 
+/// Returns the peer address and session ALPN when the ticket's session belongs
+/// to one of the `accepted` protocol families.
 pub(crate) fn connection_target(
     ticket: &str,
-    expected_alpn: &[u8],
+    accepted: &[&[u8]],
 ) -> Result<(EndpointAddr, Vec<u8>)> {
     let decoded = decode(ticket)?;
     let alpn = decoded
         .session_alpn
         .context("Ticket has no transfer session. Generate a new ticket on the other device.")?;
-    let prefix = format!("{}/", std::str::from_utf8(expected_alpn)?);
-    if !alpn.starts_with(&prefix)
-        || alpn.len() != prefix.len() + 64
-        || !alpn[prefix.len()..].bytes().all(|b| b.is_ascii_hexdigit())
-    {
+    if !accepted.iter().any(|family| session_matches(&alpn, family)) {
         bail!("Ticket is for a different transfer direction or has an invalid session. Generate a new ticket on the other device.");
     }
     Ok((decoded.endpoint, alpn.into_bytes()))
+}
+
+pub(crate) fn session_matches(alpn: &str, family: &[u8]) -> bool {
+    let Ok(family) = std::str::from_utf8(family) else {
+        return false;
+    };
+    alpn.strip_prefix(family)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(|nonce| nonce.len() == 64 && nonce.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Endpoint id of the ticket's peer, used to merge the same device seen over
+/// several discovery transports.
+pub fn peer_id(ticket: &str) -> Result<String> {
+    Ok(decode(ticket)?.endpoint.id.to_string())
+}
+
+/// Whether the peer could be reached through a relay when the ticket was made.
+pub fn has_relay(ticket: &str) -> bool {
+    decode(ticket).is_ok_and(|t| t.endpoint.relay_urls().next().is_some())
+}
+
+/// Re-encode a ticket within `max_len` bytes by dropping IP addresses, IPv6
+/// first. The relay URL is kept because it works across networks. Used for
+/// Bluetooth beacons, whose GATT values are limited to 512 bytes.
+pub fn compact(ticket: &str, max_len: usize) -> Result<String> {
+    let decoded = decode(ticket)?;
+    let session = decoded.session_alpn.as_deref();
+    let mut addrs: Vec<TransportAddr> = filter_node_addr(&decoded.endpoint)
+        .addrs
+        .into_iter()
+        .collect();
+    // Truncation drops from the end, so order by likely usefulness: relays, then
+    // home/office LAN ranges, then other private ranges (often container or VPN
+    // bridges), then public IPv4, then IPv6.
+    addrs.sort_by_key(|addr| match addr {
+        TransportAddr::Relay(_) => 0,
+        TransportAddr::Ip(SocketAddr::V4(ip)) => match ip.ip().octets() {
+            [192, 168, ..] => 1,
+            [10, ..] => 2,
+            [172, b, ..] if (16..32).contains(&b) => 3,
+            _ => 4,
+        },
+        _ => 5,
+    });
+    while !addrs.is_empty() {
+        let endpoint = EndpointAddr::from_parts(decoded.endpoint.id, addrs.iter().cloned());
+        let encoded = serialize_session(&endpoint, session)?;
+        if encoded.len() <= max_len {
+            return Ok(encoded);
+        }
+        addrs.pop();
+    }
+    bail!("ticket does not fit in {max_len} bytes")
 }
 
 fn decode(ticket: &str) -> Result<Ticket> {
@@ -178,9 +230,41 @@ mod tests {
     fn session_ticket_is_bound_to_transfer_direction() {
         let nonce = "a".repeat(64);
         let encoded = serialize_session(&address(), Some(&format!("p2p-share/2/{nonce}"))).unwrap();
-        assert!(connection_target(&encoded, crate::engine::ALPN).is_ok());
-        assert!(connection_target(&encoded, crate::engine::ALPN_REVERSE).is_err());
-        assert!(connection_target(&serialize(&address()).unwrap(), crate::engine::ALPN).is_err());
+        assert!(connection_target(&encoded, &[crate::engine::ALPN]).is_ok());
+        assert!(connection_target(&encoded, &[crate::engine::ALPN_REVERSE]).is_err());
+        assert!(connection_target(&encoded, &[crate::engine::ALPN_NEARBY]).is_err());
+        assert!(
+            connection_target(&serialize(&address()).unwrap(), &[crate::engine::ALPN]).is_err()
+        );
+        let nearby =
+            serialize_session(&address(), Some(&format!("p2p-share/2-nearby/{nonce}"))).unwrap();
+        let accepted = [crate::engine::ALPN_REVERSE, crate::engine::ALPN_NEARBY];
+        assert!(connection_target(&nearby, &accepted).is_ok());
+    }
+
+    #[test]
+    fn compact_ticket_keeps_relay_and_lan_address_over_bridges() {
+        let mut addr = EndpointAddr::new(iroh::SecretKey::generate().public())
+            .with_relay_url("https://relay.example./".parse().unwrap());
+        for bridge in 17..30 {
+            addr = addr.with_ip_addr(format!("172.{bridge}.0.1:4000").parse().unwrap());
+        }
+        addr = addr.with_ip_addr("192.168.1.20:4000".parse().unwrap());
+        for i in 1..12 {
+            addr = addr.with_ip_addr(format!("[2001:db8::{i}]:4000").parse().unwrap());
+        }
+        let session = format!("p2p-share/2-nearby/{}", "b".repeat(64));
+        let full = serialize_session(&addr, Some(&session)).unwrap();
+        let small = compact(&full, 480).unwrap();
+        assert!(small.len() <= 480 && small.len() < full.len());
+        let kept = deserialize(&small).unwrap();
+        assert!(kept.relay_urls().next().is_some());
+        assert!(kept
+            .ip_addrs()
+            .any(|ip| ip.to_string() == "192.168.1.20:4000"));
+        assert_eq!(peer_id(&small).unwrap(), addr.id.to_string());
+        assert!(has_relay(&small));
+        assert!(compact(&full, 40).is_err());
     }
 
     #[test]

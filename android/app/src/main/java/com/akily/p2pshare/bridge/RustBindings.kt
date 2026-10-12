@@ -38,6 +38,30 @@ object RustBindings {
     external fun nativeStartReceiveListen(handle: Long, outputDir: String)
 
     @JvmStatic
+    external fun nativeStartReceiveNearby(handle: Long, outputDir: String)
+
+    @JvmStatic
+    external fun nativeSetDeviceName(handle: Long, name: String)
+
+    @JvmStatic
+    external fun nativeAnswerOffer(handle: Long, accept: Boolean): Boolean
+
+    @JvmStatic
+    external fun nativeHasRelay(handle: Long): Boolean
+
+    @JvmStatic
+    external fun nativeRebind(handle: Long)
+
+    @JvmStatic
+    external fun nativeStartBrowse(handle: Long)
+
+    @JvmStatic
+    external fun nativeStopBrowse(handle: Long)
+
+    @JvmStatic
+    external fun nativePollNearby(handle: Long): String?
+
+    @JvmStatic
     external fun nativePollEvent(handle: Long): String?
 
     @JvmStatic

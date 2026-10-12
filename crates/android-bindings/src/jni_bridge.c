@@ -1,4 +1,5 @@
 #include <jni.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 extern uint64_t p2pshare_controller_create(void);
@@ -16,6 +17,14 @@ extern void p2pshare_controller_start_receive_target(
     const char *output_dir
 );
 extern void p2pshare_controller_start_receive_listen(uint64_t handle, const char *output_dir);
+extern void p2pshare_controller_start_receive_nearby(uint64_t handle, const char *output_dir);
+extern void p2pshare_controller_set_device_name(uint64_t handle, const char *name);
+extern bool p2pshare_controller_answer_offer(uint64_t handle, bool accept);
+extern bool p2pshare_controller_has_relay(uint64_t handle);
+extern void p2pshare_controller_rebind(uint64_t handle);
+extern void p2pshare_controller_start_browse(uint64_t handle);
+extern void p2pshare_controller_stop_browse(uint64_t handle);
+extern const char *p2pshare_controller_poll_nearby_json(uint64_t handle);
 extern const char *p2pshare_controller_poll_event_json(uint64_t handle);
 extern void p2pshare_controller_cancel(uint64_t handle);
 extern void p2pshare_free_cstring(const char *ptr);
@@ -122,16 +131,77 @@ static void native_start_receive_listen(
     (*env)->ReleaseStringUTFChars(env, output_dir, output);
 }
 
-static jstring native_poll_event(JNIEnv *env, jclass clazz, jlong handle) {
+/* Calls `action` with a temporary UTF-8 copy of `value`. */
+static void with_utf(
+    JNIEnv *env,
+    jlong handle,
+    jstring value,
+    void (*action)(uint64_t, const char *)
+) {
+    if (value == NULL) return;
+    const char *text = (*env)->GetStringUTFChars(env, value, NULL);
+    if (text == NULL) return;
+    action((uint64_t) handle, text);
+    (*env)->ReleaseStringUTFChars(env, value, text);
+}
+
+static void native_start_receive_nearby(JNIEnv *env, jclass clazz, jlong handle, jstring output_dir) {
     (void) clazz;
-    const char *json = p2pshare_controller_poll_event_json((uint64_t) handle);
+    with_utf(env, handle, output_dir, p2pshare_controller_start_receive_nearby);
+}
+
+static void native_set_device_name(JNIEnv *env, jclass clazz, jlong handle, jstring name) {
+    (void) clazz;
+    with_utf(env, handle, name, p2pshare_controller_set_device_name);
+}
+
+static jboolean native_answer_offer(JNIEnv *env, jclass clazz, jlong handle, jboolean accept) {
+    (void) env;
+    (void) clazz;
+    return p2pshare_controller_answer_offer((uint64_t) handle, accept == JNI_TRUE) ? JNI_TRUE : JNI_FALSE;
+}
+
+static jboolean native_has_relay(JNIEnv *env, jclass clazz, jlong handle) {
+    (void) env;
+    (void) clazz;
+    return p2pshare_controller_has_relay((uint64_t) handle) ? JNI_TRUE : JNI_FALSE;
+}
+
+static void native_rebind(JNIEnv *env, jclass clazz, jlong handle) {
+    (void) env;
+    (void) clazz;
+    p2pshare_controller_rebind((uint64_t) handle);
+}
+
+static void native_start_browse(JNIEnv *env, jclass clazz, jlong handle) {
+    (void) env;
+    (void) clazz;
+    p2pshare_controller_start_browse((uint64_t) handle);
+}
+
+static void native_stop_browse(JNIEnv *env, jclass clazz, jlong handle) {
+    (void) env;
+    (void) clazz;
+    p2pshare_controller_stop_browse((uint64_t) handle);
+}
+
+static jstring take_json(JNIEnv *env, const char *json) {
     if (json == NULL) {
         return NULL;
     }
-
     jstring out = (*env)->NewStringUTF(env, json);
     p2pshare_free_cstring(json);
     return out;
+}
+
+static jstring native_poll_nearby(JNIEnv *env, jclass clazz, jlong handle) {
+    (void) clazz;
+    return take_json(env, p2pshare_controller_poll_nearby_json((uint64_t) handle));
+}
+
+static jstring native_poll_event(JNIEnv *env, jclass clazz, jlong handle) {
+    (void) clazz;
+    return take_json(env, p2pshare_controller_poll_event_json((uint64_t) handle));
 }
 
 static void native_cancel(JNIEnv *env, jclass clazz, jlong handle) {
@@ -165,6 +235,14 @@ int p2pshare_jni_register(JavaVM *vm) {
         {"nativeStartSendToTicket", "(JLjava/lang/String;Ljava/lang/String;)V", (void *) native_start_send_to_ticket},
         {"nativeStartReceiveTarget", "(JLjava/lang/String;Ljava/lang/String;)V", (void *) native_start_receive_target},
         {"nativeStartReceiveListen", "(JLjava/lang/String;)V", (void *) native_start_receive_listen},
+        {"nativeStartReceiveNearby", "(JLjava/lang/String;)V", (void *) native_start_receive_nearby},
+        {"nativeSetDeviceName", "(JLjava/lang/String;)V", (void *) native_set_device_name},
+        {"nativeAnswerOffer", "(JZ)Z", (void *) native_answer_offer},
+        {"nativeHasRelay", "(J)Z", (void *) native_has_relay},
+        {"nativeRebind", "(J)V", (void *) native_rebind},
+        {"nativeStartBrowse", "(J)V", (void *) native_start_browse},
+        {"nativeStopBrowse", "(J)V", (void *) native_stop_browse},
+        {"nativePollNearby", "(J)Ljava/lang/String;", (void *) native_poll_nearby},
         {"nativePollEvent", "(J)Ljava/lang/String;", (void *) native_poll_event},
         {"nativeCancel", "(J)V", (void *) native_cancel},
     };

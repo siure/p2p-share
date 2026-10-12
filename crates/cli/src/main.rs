@@ -7,11 +7,13 @@ use clap::{Parser, Subcommand};
 use p2p_share_core::events::{
     ConnectionPathKind, TransferContentKind, TransferEvent, TransferEventSink,
 };
+use p2p_share_core::nearby::{NearbyEvent, NearbyPeer};
+use p2p_share_core::TransferEngine;
 use serde::Serialize;
 
 mod worker;
 
-const TRANSFER_EVENT_SCHEMA_VERSION: &str = "1.1.0";
+const TRANSFER_EVENT_SCHEMA_VERSION: &str = "1.2.0";
 
 /// p2p-share — simple peer-to-peer file transfer.
 ///
@@ -24,6 +26,10 @@ struct Cli {
     /// Useful for integrations such as desktop GUI frontends.
     #[arg(long, global = true)]
     json: bool,
+
+    /// Name shown to nearby devices. Defaults to the host name.
+    #[arg(long, global = true)]
+    name: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -41,6 +47,10 @@ enum Command {
         /// Use the ticket shown by `p2p-share receive --qr`.
         #[arg(long)]
         to: Option<String>,
+
+        /// Send to a nearby device by name (see `p2p-share nearby`).
+        #[arg(long, conflicts_with = "to")]
+        nearby: Option<String>,
     },
 
     /// Receive a file from another device.
@@ -58,6 +68,17 @@ enum Command {
         /// Useful when the sender is a phone and typing long tickets is impractical.
         #[arg(long)]
         qr: bool,
+
+        /// Become visible to nearby devices and ask before accepting files.
+        #[arg(long, conflicts_with_all = ["target", "qr"])]
+        nearby: bool,
+    },
+
+    /// List devices that are receiving nearby (`receive --nearby`).
+    Nearby {
+        /// How long to look for devices.
+        #[arg(long, default_value_t = 5)]
+        seconds: u64,
     },
 
     /// Print machine-readable version metadata.
@@ -83,6 +104,12 @@ struct TransferEventRecord {
     item_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transfer_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lan: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bluetooth: Option<bool>,
 }
 
 impl TransferEventRecord {
@@ -101,6 +128,9 @@ impl TransferEventRecord {
             content_kind: None,
             item_count: None,
             transfer_id: None,
+            peer_id: None,
+            lan: None,
+            bluetooth: None,
         }
     }
 
@@ -205,15 +235,132 @@ fn map_event(event: TransferEvent) -> TransferEventRecord {
             item_count: Some(result.item_count),
             ..TransferEventRecord::base("completed")
         },
+        TransferEvent::Offer(offer) => TransferEventRecord {
+            message: offer.sender_name,
+            file_name: Some(offer.file_name),
+            size_bytes: Some(offer.size_bytes),
+            content_kind: Some(offer.content_kind),
+            item_count: Some(offer.item_count),
+            ..TransferEventRecord::base("offer")
+        },
+        TransferEvent::Beacon(beacon) => TransferEventRecord {
+            value: Some(beacon),
+            ..TransferEventRecord::base("beacon")
+        },
         TransferEvent::Error { code, message } => TransferEventRecord::error(code, message),
     }
+}
+
+/// Worker-level records: frontends key peers by `peer_id`.
+fn map_nearby(event: NearbyEvent) -> TransferEventRecord {
+    match event {
+        NearbyEvent::Found(peer) => TransferEventRecord {
+            peer_id: Some(peer.id),
+            message: Some(peer.name),
+            value: Some(peer.ticket),
+            lan: Some(peer.lan),
+            bluetooth: Some(peer.bluetooth.is_some()),
+            ..TransferEventRecord::base("nearby_found")
+        },
+        NearbyEvent::Lost(id) => TransferEventRecord {
+            peer_id: Some(id),
+            ..TransferEventRecord::base("nearby_lost")
+        },
+    }
+}
+
+/// Browse until a peer named `query` (case-insensitive) or with that id prefix appears.
+async fn find_nearby(engine: &TransferEngine, query: &str) -> Result<NearbyPeer> {
+    let (tx, mut found) = tokio::sync::mpsc::unbounded_channel();
+    let _browser = engine.browse_nearby(move |event| {
+        if let NearbyEvent::Found(peer) = event {
+            let _ = tx.send(peer);
+        }
+    });
+    let query = query.trim();
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while let Some(peer) = found.recv().await {
+            if peer.name.eq_ignore_ascii_case(query)
+                || (query.len() >= 6 && peer.id.starts_with(query))
+            {
+                return Some(peer);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+    .ok_or_else(|| {
+        anyhow!("No nearby device named \"{query}\". Run `p2p-share nearby` to list them.")
+    })
+}
+
+/// Print peers as they appear; JSON mode emits the worker's records instead.
+async fn list_nearby(engine: &TransferEngine, seconds: u64, json: bool) -> Result<()> {
+    if !json {
+        eprintln!("Looking for nearby devices for {seconds} seconds...");
+    }
+    let _browser = engine.browse_nearby(move |event| match event {
+        _ if json => emit_json_line(&map_nearby(event)),
+        NearbyEvent::Found(peer) => {
+            let via = match (peer.lan, peer.bluetooth.is_some()) {
+                (true, true) => "LAN, Bluetooth",
+                (true, false) => "LAN",
+                _ => "Bluetooth",
+            };
+            println!("{}\t{via}\t{}", peer.name, peer.ticket);
+        }
+        NearbyEvent::Lost(_) => {}
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+    Ok(())
+}
+
+/// Commands that need a configured long-lived engine (nearby features).
+async fn run_engine(
+    command: Command,
+    name: Option<String>,
+    sink: Option<Arc<dyn TransferEventSink>>,
+) -> Result<()> {
+    let engine = TransferEngine::bind().await?;
+    if let Some(name) = name {
+        engine.set_device_name(&name);
+    }
+    let result = match command {
+        Command::Receive { output, .. } => engine.receive_nearby(&output, sink).await,
+        Command::Send {
+            files,
+            nearby: Some(query),
+            ..
+        } => match find_nearby(&engine, &query).await {
+            Ok(peer) => engine.send_nearby(&files, &peer, sink).await,
+            Err(err) => Err(err),
+        },
+        Command::Nearby { seconds } => list_nearby(&engine, seconds, sink.is_some()).await,
+        _ => unreachable!("only nearby commands use run_engine"),
+    };
+    engine.close().await;
+    result
+}
+
+fn uses_nearby(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Receive { nearby: true, .. }
+            | Command::Send {
+                nearby: Some(_),
+                ..
+            }
+            | Command::Nearby { .. }
+    )
 }
 
 fn emit_version_json() -> Result<()> {
     let payload = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "schema_version": TRANSFER_EVENT_SCHEMA_VERSION,
-        "capabilities": ["worker"],
+        "capabilities": ["worker", "nearby"],
     });
     let mut out = io::stdout().lock();
     writeln!(out, "{}", serde_json::to_string(&payload)?)?;
@@ -228,42 +375,43 @@ fn missing_target_error() -> anyhow::Error {
     )
 }
 
-async fn run_human(command: Command) -> Result<()> {
+async fn run_human(command: Command, name: Option<String>) -> Result<()> {
+    if uses_nearby(&command) {
+        return run_engine(command, name, None).await;
+    }
     match command {
         Command::Worker => Err(anyhow!("worker requires --json")),
         Command::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Command::Send { files, to: None } => p2p_share_core::sender::run_paths(&files).await,
+        Command::Send {
+            files, to: None, ..
+        } => p2p_share_core::sender::run_paths(&files).await,
         Command::Send {
             files,
             to: Some(ticket),
+            ..
         } => p2p_share_core::sender::run_reverse_paths(&files, &ticket).await,
         Command::Receive {
-            target: _,
-            output,
-            qr: true,
+            output, qr: true, ..
         } => p2p_share_core::receiver::run_listen(&output).await,
         Command::Receive {
             target: Some(target),
             output,
-            qr: false,
+            ..
         } => p2p_share_core::receiver::run(&target, &output).await,
-        Command::Receive {
-            target: None,
-            output: _,
-            qr: false,
-        } => Err(missing_target_error()),
+        Command::Receive { target: None, .. } => Err(missing_target_error()),
+        Command::Nearby { .. } => unreachable!("handled by run_engine"),
     }
 }
 
-async fn run_json(command: Command) -> Result<()> {
+async fn run_json(command: Command, name: Option<String>) -> Result<()> {
     if let Command::Version = &command {
         return emit_version_json();
     }
     if let Command::Worker = &command {
-        return worker::run().await;
+        return worker::run(name).await;
     }
 
     let sink: Arc<dyn TransferEventSink> = Arc::new(StdoutJsonSink::default());
@@ -271,31 +419,28 @@ async fn run_json(command: Command) -> Result<()> {
 
     let result = match command {
         Command::Version | Command::Worker => unreachable!("handled above"),
-        Command::Send { files, to: None } => {
-            p2p_share_core::sender::run_paths_with_sink(&files, Some(sink.clone())).await
-        }
+        command if uses_nearby(&command) => run_engine(command, name, Some(sink.clone())).await,
+        Command::Send {
+            files, to: None, ..
+        } => p2p_share_core::sender::run_paths_with_sink(&files, Some(sink.clone())).await,
         Command::Send {
             files,
             to: Some(ticket),
+            ..
         } => {
             p2p_share_core::sender::run_reverse_paths_with_sink(&files, &ticket, Some(sink.clone()))
                 .await
         }
         Command::Receive {
-            target: _,
-            output,
-            qr: true,
+            output, qr: true, ..
         } => p2p_share_core::receiver::run_listen_with_sink(&output, Some(sink.clone())).await,
         Command::Receive {
             target: Some(target),
             output,
-            qr: false,
+            ..
         } => p2p_share_core::receiver::run_with_sink(&target, &output, Some(sink.clone())).await,
-        Command::Receive {
-            target: None,
-            output: _,
-            qr: false,
-        } => Err(missing_target_error()),
+        Command::Receive { target: None, .. } => Err(missing_target_error()),
+        Command::Nearby { .. } => unreachable!("handled by run_engine"),
     };
 
     if let Err(err) = &result {
@@ -313,9 +458,9 @@ async fn main() {
     let cli = Cli::parse();
 
     let result = if cli.json {
-        run_json(cli.command).await
+        run_json(cli.command, cli.name).await
     } else {
-        run_human(cli.command).await
+        run_human(cli.command, cli.name).await
     };
 
     if let Err(e) = result {
@@ -393,9 +538,9 @@ mod tests {
     fn send_command_accepts_multiple_files() {
         let cli = Cli::try_parse_from(["p2p-share", "send", "a.txt", "b.txt"]).expect("parse");
         match cli.command {
-            Command::Send { files, to } => {
+            Command::Send { files, to, nearby } => {
                 assert_eq!(files, vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
-                assert!(to.is_none());
+                assert!(to.is_none() && nearby.is_none());
             }
             other => panic!("unexpected command: {:?}", other),
         }

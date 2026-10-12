@@ -185,3 +185,82 @@ fn worker_reuses_endpoint_for_normal_reverse_and_bundle_transfers() {
     sender.shutdown();
     receiver.shutdown();
 }
+
+impl Worker {
+    /// Next worker-level record (no transfer id) of `kind`.
+    fn wait_global(&self, kind: &str, matches: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let event = self
+                .events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|err| panic!("waiting for {kind}: {err}"));
+            if event["kind"] == kind && event["transfer_id"].is_null() && matches(&event) {
+                return event;
+            }
+        }
+    }
+}
+
+#[test]
+fn nearby_receiver_asks_before_accepting_and_reports_sender_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("hello.txt");
+    std::fs::write(&input, b"hello nearby").unwrap();
+    let output = temp.path().join("out");
+    let mut sender = Worker::start();
+    let mut receiver = Worker::start();
+    sender.send(json!({"command":"set_name","name":"Worker laptop"}));
+
+    for (id, accept) in [("declined", false), ("accepted", true)] {
+        receiver.send(json!({"id":id,"command":"receive","output":output,"nearby":true}));
+        let ticket = receiver.wait(Some(id), "ticket");
+        sender.send(json!({"id":id,"command":"send","files":[&input],"to":ticket["value"]}));
+        let offer = receiver.wait(Some(id), "offer");
+        assert_eq!(offer["message"], "Worker laptop");
+        assert_eq!(offer["file_name"], "hello.txt");
+        assert_eq!(offer["size_bytes"], 12);
+        receiver.send(json!({"id":id,"command":"answer","accept":accept}));
+        if accept {
+            receiver.wait(Some(id), "completed");
+            sender.wait(Some(id), "completed");
+            assert_eq!(sender.wait(Some(id), "process_end")["value"], "completed");
+        } else {
+            let error = sender.wait(Some(id), "error");
+            assert!(error["message"].as_str().unwrap().contains("declined"));
+            receiver.send(json!({"id":id,"command":"cancel"}));
+            assert_eq!(receiver.wait(Some(id), "process_end")["value"], "canceled");
+        }
+    }
+    assert_eq!(
+        std::fs::read(output.join("hello.txt")).unwrap(),
+        b"hello nearby"
+    );
+    sender.shutdown();
+    receiver.shutdown();
+}
+
+#[test]
+#[ignore = "needs multicast (mDNS) on a local network interface"]
+fn browsing_worker_finds_and_sends_to_nearby_receiver() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("found.txt");
+    std::fs::write(&input, b"found over mdns").unwrap();
+    let mut sender = Worker::start();
+    let mut receiver = Worker::start();
+    receiver.send(json!({"command":"set_name","name":"Desk receiver"}));
+    receiver
+        .send(json!({"id":"r","command":"receive","output":temp.path().join("out"),"nearby":true}));
+    sender.send(json!({"command":"browse"}));
+    let peer = sender.wait_global("nearby_found", |e| e["message"] == "Desk receiver");
+    assert_eq!(peer["lan"], true);
+    sender.send(json!({"id":"s","command":"send","files":[&input],"nearby":peer["peer_id"]}));
+    receiver.wait(Some("r"), "offer");
+    receiver.send(json!({"id":"r","command":"answer","accept":true}));
+    receiver.wait(Some("r"), "completed");
+    sender.wait(Some("s"), "completed");
+    sender.wait_global("nearby_lost", |e| e["peer_id"] == peer["peer_id"]);
+    sender.send(json!({"command":"stop_browse"}));
+    sender.shutdown();
+    receiver.shutdown();
+}

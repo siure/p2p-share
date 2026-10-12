@@ -8,15 +8,26 @@ use tokio::io::AsyncWriteExt;
 
 use crate::bundle;
 use crate::crypto;
-use crate::events::{TransferCompleted, TransferContentKind, TransferEvent};
+use crate::events::{TransferCompleted, TransferContentKind, TransferEvent, TransferOffer};
+use crate::nearby;
 use crate::progress::transfer_progress_bar;
-use crate::protocol::{human_bytes, FileHeader};
+use crate::protocol::{human_bytes, FileHeader, OFFER_ACCEPT, OFFER_DECLINE};
 use crate::ticket;
 
 use crate::engine::{
     self, bounded, emit, status, PartialFile, Session, SharedSink, TransferEngine, ALPN,
-    ALPN_REVERSE,
+    ALPN_NEARBY, ALPN_REVERSE,
 };
+
+/// The receiver turned an offer down; nearby mode keeps listening afterwards.
+#[derive(Debug)]
+struct OfferDeclined;
+impl std::fmt::Display for OfferDeclined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Transfer declined.")
+    }
+}
+impl std::error::Error for OfferDeclined {}
 
 fn unique_path(dir: &Path, name: &str) -> PathBuf {
     let candidate = dir.join(name);
@@ -93,10 +104,10 @@ pub(crate) async fn receive_on_endpoint(
     }
     let conn = if let Some(target) = target {
         status(sink.as_ref(), "Connecting to sender...");
-        let (addr, session_alpn) = ticket::connection_target(target, ALPN)?;
+        let (addr, session_alpn) = ticket::connection_target(target, &[ALPN])?;
         bounded("connecting to sender", ep.connect(addr, &session_alpn)).await?
     } else {
-        engine::accept_with_tickets(ep, ALPN_REVERSE, sink.as_ref()).await?
+        engine::accept_with_tickets(ep, ALPN_REVERSE, sink.as_ref(), &|_| {}).await?
     };
     let mut session = Session::new(conn, sink.clone());
     let conn = &session.conn;
@@ -126,12 +137,78 @@ pub(crate) async fn receive_on_endpoint(
         output_dir,
         sink.as_ref(),
         false,
+        None,
     )
     .await?;
     confirm_done_delivery(conn, &mut send_stream).await?;
     session.complete();
     emit(sink.as_ref(), TransferEvent::Completed(completed));
     Ok(())
+}
+
+pub(crate) async fn receive_nearby_on_endpoint(
+    engine: &TransferEngine,
+    output_dir: &Path,
+    sink: Option<SharedSink>,
+) -> Result<()> {
+    let ep = &engine.endpoint;
+    let name = engine.device_name();
+    let advertiser = nearby::Advertiser::start(&name, sink.as_ref()).await;
+    status(
+        sink.as_ref(),
+        format!("Visible to nearby devices as \"{name}\"."),
+    );
+    let publish = |ticket: &str| match nearby::Beacon::new(&name, ticket) {
+        Ok(beacon) => {
+            advertiser.update(ticket, &beacon);
+            emit(sink.as_ref(), TransferEvent::Beacon(beacon.to_json()));
+        }
+        Err(err) => status(sink.as_ref(), format!("Nearby beacon unavailable: {err:#}")),
+    };
+    loop {
+        let conn = engine::accept_with_tickets(ep, ALPN_NEARBY, sink.as_ref(), &publish).await?;
+        let mut session = Session::new(conn, sink.clone());
+        let conn = &session.conn;
+        status(sink.as_ref(), "Sender connected.");
+        let (mut send_stream, mut recv_stream) =
+            bounded("waiting for transfer stream", conn.accept_bi()).await?;
+        let (mut transport, code) = bounded(
+            "establishing encryption",
+            crypto::handshake_responder(&mut recv_stream, &mut send_stream),
+        )
+        .await?;
+        emit(sink.as_ref(), TransferEvent::HandshakeCode(code));
+        let result = receive_file(
+            &mut recv_stream,
+            &mut send_stream,
+            &mut transport,
+            output_dir,
+            sink.as_ref(),
+            false,
+            Some(engine),
+        )
+        .await;
+        match result {
+            Err(err) if err.is::<OfferDeclined>() => {
+                // Deliver DECLINE before the session closes the connection.
+                if send_stream.finish().is_ok() {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        send_stream.stopped(),
+                    )
+                    .await;
+                }
+                status(sink.as_ref(), "Declined. Still visible to nearby devices.");
+            }
+            result => {
+                let completed = result?;
+                confirm_done_delivery(conn, &mut send_stream).await?;
+                session.complete();
+                emit(sink.as_ref(), TransferEvent::Completed(completed));
+                return Ok(());
+            }
+        }
+    }
 }
 
 async fn run_direct_tcp(addr: &str, output_dir: &Path, sink: Option<SharedSink>) -> Result<()> {
@@ -152,6 +229,7 @@ async fn run_direct_tcp(addr: &str, output_dir: &Path, sink: Option<SharedSink>)
         output_dir,
         sink.as_ref(),
         true,
+        None,
     )
     .await?;
     emit(sink.as_ref(), TransferEvent::Completed(completed));
@@ -159,6 +237,7 @@ async fn run_direct_tcp(addr: &str, output_dir: &Path, sink: Option<SharedSink>)
 }
 
 /// Shared file-reception logic used by all receive paths (iroh, TCP, listen).
+/// With `approval`, the person is asked before any data is accepted.
 async fn receive_file<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -166,6 +245,7 @@ async fn receive_file<R, W>(
     output_dir: &Path,
     sink: Option<&SharedSink>,
     legacy_tcp_ack: bool,
+    approval: Option<&TransferEngine>,
 ) -> Result<TransferCompleted>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -207,6 +287,30 @@ where
         )
     };
     status(sink, incoming_status);
+
+    if let Some(engine) = approval {
+        let offer = TransferOffer {
+            sender_name: header.sender_name.clone(),
+            file_name: completed_name.clone(),
+            size_bytes: header.size,
+            content_kind,
+            item_count,
+        };
+        let accepted = engine::ask_offer(engine, sink, offer).await;
+        let verdict = if accepted {
+            OFFER_ACCEPT
+        } else {
+            OFFER_DECLINE
+        };
+        bounded(
+            "answering the transfer offer",
+            crypto::encrypted_write(writer, transport, verdict),
+        )
+        .await?;
+        if !accepted {
+            return Err(OfferDeclined.into());
+        }
+    }
 
     if legacy_tcp_ack {
         bounded(

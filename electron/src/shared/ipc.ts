@@ -1,6 +1,12 @@
 import type { SchemaCompatibility } from "./schema";
 
-export type TransferMode = "send_wait" | "send_to_ticket" | "receive_target" | "receive_listen";
+export type TransferMode =
+  | "send_wait"
+  | "send_to_ticket"
+  | "send_nearby"
+  | "receive_target"
+  | "receive_listen"
+  | "receive_nearby";
 
 export interface StartTransferPayload {
   mode: TransferMode;
@@ -8,6 +14,18 @@ export interface StartTransferPayload {
   ticket?: string;
   target?: string;
   outputDir?: string;
+  /** `peer_id` of a nearby device, for `send_nearby`. */
+  peerId?: string;
+}
+
+/** Worker-level discovery records (no `transfer_id`). */
+export interface NearbyEvent {
+  kind: "nearby_found" | "nearby_lost";
+  peer_id: string;
+  /** Device name, on `nearby_found`. */
+  message?: string;
+  lan?: boolean;
+  bluetooth?: boolean;
 }
 
 export interface TransferEventBase {
@@ -55,6 +73,14 @@ export interface TransferEventCompleted extends TransferEventBase {
   item_count?: number;
 }
 
+/** A nearby sender waits for `answerOffer`; `message` is its device name. */
+export interface TransferEventOffer extends TransferEventBase {
+  kind: "offer";
+  file_name?: string;
+  size_bytes?: number;
+  item_count?: number;
+}
+
 export interface TransferEventError extends TransferEventBase {
   kind: "error";
 }
@@ -76,6 +102,7 @@ export type TransferEvent =
   | TransferEventProgress
   | TransferEventConnectionPath
   | TransferEventCompleted
+  | TransferEventOffer
   | TransferEventError
   | TransferEventProcessEnd
   | TransferEventUnknown;
@@ -121,7 +148,10 @@ export interface P2PShareApi {
   pickDir: (defaultPath?: string) => Promise<string | null>;
   startTransfer: (payload: StartTransferPayload) => Promise<{ ok: boolean }>;
   cancelTransfer: () => Promise<{ ok: boolean }>;
+  answerOffer: (accept: boolean) => Promise<{ ok: boolean }>;
   onTransferEvent: (handler: (event: TransferEvent) => void) => () => void;
+  setBrowsing: (on: boolean) => Promise<{ ok: boolean }>;
+  onNearbyEvent: (handler: (event: NearbyEvent) => void) => () => void;
   copyText: (text: string) => Promise<{ ok: boolean }>;
   createQrDataUrl: (text: string) => Promise<string | null>;
   getPathForFile: (file: File) => string;

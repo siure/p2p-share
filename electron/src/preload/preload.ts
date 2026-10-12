@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 
-import type { P2PShareApi, StartTransferPayload, TransferEvent, UpdateState } from "../shared/ipc";
+import type { NearbyEvent, P2PShareApi, StartTransferPayload, TransferEvent, UpdateState } from "../shared/ipc";
 
 const api: P2PShareApi = {
   getUpdateState: () => ipcRenderer.invoke("updates:state"),
@@ -17,6 +17,13 @@ const api: P2PShareApi = {
   pickDir: (defaultPath?: string) => ipcRenderer.invoke("dialog:pick-dir", defaultPath),
   startTransfer: (payload: StartTransferPayload) => ipcRenderer.invoke("transfer:start", payload),
   cancelTransfer: () => ipcRenderer.invoke("transfer:cancel"),
+  answerOffer: (accept: boolean) => ipcRenderer.invoke("transfer:answer", accept),
+  setBrowsing: (on: boolean) => ipcRenderer.invoke("nearby:browse", on),
+  onNearbyEvent: (handler: (event: NearbyEvent) => void) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, nearbyEvent: NearbyEvent) => handler(nearbyEvent);
+    ipcRenderer.on("nearby:event", wrapped);
+    return () => ipcRenderer.removeListener("nearby:event", wrapped);
+  },
   onTransferEvent: (handler: (event: TransferEvent) => void) => {
     const wrapped = (_event: Electron.IpcRendererEvent, transferEvent: TransferEvent) => {
       handler(transferEvent);

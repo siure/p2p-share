@@ -82,7 +82,17 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import android.Manifest
+import android.os.Build
+import androidx.compose.material.icons.filled.Bluetooth
+import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
+import com.akily.p2pshare.model.OfferUi
+import com.akily.p2pshare.model.ReceiveMode
+import com.akily.p2pshare.model.SendMode
 import com.akily.p2pshare.model.TransferHistoryEntry
+import com.akily.p2pshare.nearby.NearbyPeer
 import com.akily.p2pshare.model.TransferStage
 import com.akily.p2pshare.model.TransferTab
 import com.akily.p2pshare.model.TransferUiState
@@ -121,6 +131,16 @@ fun P2PShareApp(viewModel: TransferViewModel, updateViewModel: UpdateViewModel) 
     val tabs = TransferTab.entries
     val context = LocalContext.current
     var scanDestination by remember { mutableStateOf("send") }
+    var afterNearbyPermissions by remember { mutableStateOf<(() -> Unit)?>(null) }
+    // Missing grants only disable Bluetooth and hotspots; mDNS still works.
+    val nearbyPermissions = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        afterNearbyPermissions?.invoke()
+        afterNearbyPermissions = null
+    }
+    val withNearbyPermissions = { action: () -> Unit ->
+        afterNearbyPermissions = action
+        nearbyPermissions.launch(nearbyPermissionNames())
+    }
 
     val pagerState = rememberPagerState(
         initialPage = pageForTab(selectedTab),
@@ -141,11 +161,11 @@ fun P2PShareApp(viewModel: TransferViewModel, updateViewModel: UpdateViewModel) 
         val scanned = result.contents?.trim().orEmpty()
         if (scanned.isNotEmpty()) {
             if (scanDestination == "receive") {
-                viewModel.setReceiveMode(true)
+                viewModel.setReceiveMode(ReceiveMode.CONNECT)
                 viewModel.setTargetInput(scanned)
                 viewModel.selectTab(TransferTab.RECEIVE)
             } else {
-                viewModel.setSendMode(true)
+                viewModel.setSendMode(SendMode.TICKET)
                 viewModel.setTicketInput(scanned)
                 viewModel.selectTab(TransferTab.SEND)
             }
@@ -245,14 +265,23 @@ fun P2PShareApp(viewModel: TransferViewModel, updateViewModel: UpdateViewModel) 
                                 statusLine = pageUi.statusLine,
                                 connection = pageUi.connectionPath,
                                 latencyMs = pageUi.latencyMs,
-                                sendToTicket = send.sendToTicketMode,
+                                sendMode = send.sendMode,
+                                peers = viewModel.nearby.peers,
+                                selectedPeerId = send.selectedPeerId,
+                                onSelectPeer = viewModel::selectPeer,
                                 ticketInput = send.ticketInput,
                                 selectedFile = viewModel.selectedFilesLabel,
                                 canCancelSend = viewModel.canCancelSend(),
                                 showProgress = pageUi.stage == TransferStage.TRANSFERRING || pageUi.progressTotal > 0,
                                 progressDone = pageUi.progressDone,
                                 progressTotal = pageUi.progressTotal,
-                                onToggleMode = viewModel::setSendMode,
+                                onSelectMode = { mode ->
+                                    if (mode == SendMode.NEARBY) {
+                                        withNearbyPermissions { viewModel.setSendMode(mode) }
+                                    } else {
+                                        viewModel.setSendMode(mode)
+                                    }
+                                },
                                 onTicketChange = viewModel::setTicketInput,
                                 onPickFile = { filePicker.launch(arrayOf("*/*")) },
                                 onScanQr = {
@@ -274,14 +303,21 @@ fun P2PShareApp(viewModel: TransferViewModel, updateViewModel: UpdateViewModel) 
                                 statusLine = pageUi.statusLine,
                                 connection = pageUi.connectionPath,
                                 latencyMs = pageUi.latencyMs,
-                                connectMode = receive.connectMode,
+                                receiveMode = receive.receiveMode,
+                                deviceName = viewModel.nearby.deviceName,
                                 target = receive.targetInput,
                                 outputPath = viewModel.outputFolderLabel,
                                 canCancelReceive = viewModel.canCancelReceive(),
                                 showProgress = pageUi.stage == TransferStage.TRANSFERRING || pageUi.progressTotal > 0,
                                 progressDone = pageUi.progressDone,
                                 progressTotal = pageUi.progressTotal,
-                                onToggleMode = viewModel::setReceiveMode,
+                                onSelectMode = { mode ->
+                                    if (mode == ReceiveMode.NEARBY) {
+                                        withNearbyPermissions { viewModel.setReceiveMode(mode) }
+                                    } else {
+                                        viewModel.setReceiveMode(mode)
+                                    }
+                                },
                                 onTargetChange = viewModel::setTargetInput,
                                 onPickOutput = { outputPicker.launch(null) },
                                 onScanQr = {
@@ -300,6 +336,10 @@ fun P2PShareApp(viewModel: TransferViewModel, updateViewModel: UpdateViewModel) 
                             )
 
                             TransferTab.HISTORY -> HistoryScreen(viewModel.history)
+                        }
+
+                        pageUi.offer?.let { offer ->
+                            OfferDialog(offer = offer, onAnswer = viewModel::answerOffer)
                         }
 
                         if (!pageUi.errorMessage.isNullOrBlank()) {
@@ -586,14 +626,17 @@ private fun SendScreen(
     statusLine: String,
     connection: String?,
     latencyMs: Double?,
-    sendToTicket: Boolean,
+    sendMode: SendMode,
+    peers: List<NearbyPeer>,
+    selectedPeerId: String?,
+    onSelectPeer: (String) -> Unit,
     ticketInput: String,
     selectedFile: String,
     canCancelSend: Boolean,
     showProgress: Boolean,
     progressDone: Long,
     progressTotal: Long,
-    onToggleMode: (Boolean) -> Unit,
+    onSelectMode: (SendMode) -> Unit,
     onTicketChange: (String) -> Unit,
     onPickFile: () -> Unit,
     onScanQr: () -> Unit,
@@ -610,10 +653,9 @@ private fun SendScreen(
         TransferInfoZone(status = statusLine, connection = connection, latencyMs = latencyMs)
 
         ModeToggle(
-            leftLabel = "Wait receiver",
-            rightLabel = "Use ticket",
-            rightSelected = sendToTicket,
-            onToggle = onToggleMode,
+            labels = listOf("Wait receiver", "Use ticket", "Nearby"),
+            selected = sendMode.ordinal,
+            onSelect = { onSelectMode(SendMode.entries[it]) },
         )
 
         SecondaryActionButton(
@@ -628,7 +670,11 @@ private fun SendScreen(
             maxLines = 2,
         )
 
-        if (sendToTicket) {
+        if (sendMode == SendMode.NEARBY) {
+            NearbyPeerList(peers = peers, selectedId = selectedPeerId, onSelect = onSelectPeer)
+        }
+
+        if (sendMode == SendMode.TICKET) {
             OutlinedTextField(
                 value = ticketInput,
                 onValueChange = onTicketChange,
@@ -670,14 +716,15 @@ private fun ReceiveScreen(
     statusLine: String,
     connection: String?,
     latencyMs: Double?,
-    connectMode: Boolean,
+    receiveMode: ReceiveMode,
+    deviceName: String,
     target: String,
     outputPath: String,
     canCancelReceive: Boolean,
     showProgress: Boolean,
     progressDone: Long,
     progressTotal: Long,
-    onToggleMode: (Boolean) -> Unit,
+    onSelectMode: (ReceiveMode) -> Unit,
     onTargetChange: (String) -> Unit,
     onPickOutput: () -> Unit,
     onScanQr: () -> Unit,
@@ -694,13 +741,20 @@ private fun ReceiveScreen(
         TransferInfoZone(status = statusLine, connection = connection, latencyMs = latencyMs)
 
         ModeToggle(
-            leftLabel = "Connect target",
-            rightLabel = "Listen + QR",
-            rightSelected = !connectMode,
-            onToggle = { onToggleMode(!it) },
+            labels = listOf("Connect", "Listen + QR", "Nearby"),
+            selected = receiveMode.ordinal,
+            onSelect = { onSelectMode(ReceiveMode.entries[it]) },
         )
 
-        if (connectMode) {
+        if (receiveMode == ReceiveMode.NEARBY) {
+            Text(
+                "Visible as \"$deviceName\" while receiving. You accept each transfer.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        if (receiveMode == ReceiveMode.CONNECT) {
             OutlinedTextField(
                 value = target,
                 onValueChange = onTargetChange,
@@ -1026,10 +1080,9 @@ private fun PathStrip(text: String, fallback: String, maxLines: Int = 2) {
 
 @Composable
 private fun ModeToggle(
-    leftLabel: String,
-    rightLabel: String,
-    rightSelected: Boolean,
-    onToggle: (Boolean) -> Unit,
+    labels: List<String>,
+    selected: Int,
+    onSelect: (Int) -> Unit,
 ) {
     Row(
         modifier = Modifier
@@ -1038,20 +1091,76 @@ private fun ModeToggle(
             .padding(4.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        ToggleChip(
-            label = leftLabel,
-            selected = !rightSelected,
-            modifier = Modifier.weight(1f),
-            onClick = { onToggle(false) },
-        )
-        ToggleChip(
-            label = rightLabel,
-            selected = rightSelected,
-            modifier = Modifier.weight(1f),
-            onClick = { onToggle(true) },
-        )
+        labels.forEachIndexed { index, label ->
+            ToggleChip(
+                label = label,
+                selected = index == selected,
+                modifier = Modifier.weight(1f),
+                onClick = { onSelect(index) },
+            )
+        }
     }
 }
+
+@Composable
+private fun NearbyPeerList(peers: List<NearbyPeer>, selectedId: String?, onSelect: (String) -> Unit) {
+    if (peers.isEmpty()) {
+        PathStrip(text = "", fallback = "Looking for nearby devices...", maxLines = 1)
+        return
+    }
+    peers.forEach { peer ->
+        val selected = peer.id == selectedId
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.17f) else Color.Transparent)
+                .clickable { onSelect(peer.id) }
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                peer.name,
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (peer.lan) Icon(Icons.Default.Wifi, contentDescription = "Same network", modifier = Modifier.size(16.dp))
+            if (peer.bluetoothAddress != null) {
+                Icon(Icons.Default.Bluetooth, contentDescription = "Bluetooth", modifier = Modifier.size(16.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun OfferDialog(offer: OfferUi, onAnswer: (Boolean) -> Unit) {
+    val what = if (offer.itemCount > 1) "${offer.itemCount} files" else offer.fileName
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text("Accept from ${offer.senderName}?") },
+        text = { Text("$what (${humanBytes(offer.sizeBytes)})") },
+        confirmButton = { TextButton(onClick = { onAnswer(true) }) { Text("Accept") } },
+        dismissButton = { TextButton(onClick = { onAnswer(false) }) { Text("Decline") } },
+    )
+}
+
+/** Runtime permissions for Bluetooth discovery and local-only hotspots. */
+private fun nearbyPermissionNames(): Array<String> = buildList {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        add(Manifest.permission.BLUETOOTH_SCAN)
+        add(Manifest.permission.BLUETOOTH_ADVERTISE)
+        add(Manifest.permission.BLUETOOTH_CONNECT)
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        add(Manifest.permission.NEARBY_WIFI_DEVICES)
+    } else {
+        add(Manifest.permission.ACCESS_FINE_LOCATION)
+    }
+}.toTypedArray()
 
 @Composable
 private fun ToggleChip(label: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
