@@ -29,7 +29,7 @@ android {
         applicationId = "com.akily.p2pshare"
         minSdk = 29
         targetSdk = 35
-        versionName = "0.4.0"
+        versionName = "0.5.0"
         // Preserve semantic version ordering without a separate release counter.
         val parts = versionName!!.split('.').map(String::toInt)
         require(parts.size == 3 && parts.all { it in 0..999 })
