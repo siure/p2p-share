@@ -690,11 +690,14 @@ ipcMain.handle("qr:create-data-url", async (_event, text: unknown) => {
     return null;
   }
   const { default: QRCode } = await import("qrcode");
-  return QRCode.toDataURL(payload, {
+  // SVG stays sharp at any display size. Level L keeps modules as large as possible,
+  // which matters more than damage tolerance for a code shown on a screen.
+  const svg = await QRCode.toString(payload, {
+    type: "svg",
     margin: 1,
-    width: 320,
-    errorCorrectionLevel: "M"
+    errorCorrectionLevel: "L"
   });
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 });
 
 ipcMain.handle("dialog:pick-files", async () => {

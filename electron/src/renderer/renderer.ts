@@ -766,6 +766,10 @@ qrOverlay.addEventListener("click", () => {
   qrOverlay.classList.add("hidden");
 });
 
+document.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.key === "Escape") qrOverlay.classList.add("hidden");
+});
+
 sendTicketInput.addEventListener("keydown", (e: KeyboardEvent) => {
   if (e.key === "Enter" && !isRunning) {
     void startTransfer();

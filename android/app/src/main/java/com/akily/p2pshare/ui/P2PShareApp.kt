@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -62,6 +63,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -73,15 +75,20 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.window.DialogWindowProvider
 import android.Manifest
 import android.os.Build
 import androidx.compose.material.icons.filled.Bluetooth
@@ -109,6 +116,7 @@ import com.akily.p2pshare.ui.theme.SignalRed
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
 import com.google.zxing.qrcode.QRCodeWriter
+import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import java.text.SimpleDateFormat
@@ -971,6 +979,7 @@ private fun ConnectInviteCard(ticket: String?, qrPayload: String?) {
     val payload = qrPayload?.takeIf { it.isNotBlank() } ?: ticket?.takeIf { it.isNotBlank() }
     val displayTicket = ticket?.takeIf { it.isNotBlank() } ?: payload
     val bitmap = remember(payload) { payload?.let(::generateQrBitmap) }
+    var enlarged by remember { mutableStateOf(false) }
 
     GlassCard(accent = NeonCyan, label = "Connect") {
         Text("Scan to connect", style = MaterialTheme.typography.titleMedium)
@@ -979,15 +988,26 @@ private fun ConnectInviteCard(ticket: String?, qrPayload: String?) {
             Surface(
                 shape = RoundedCornerShape(18.dp),
                 color = Color.White,
-                modifier = Modifier.align(Alignment.CenterHorizontally),
+                modifier = Modifier
+                    .align(Alignment.CenterHorizontally)
+                    .clip(RoundedCornerShape(18.dp))
+                    .clickable { enlarged = true },
             ) {
-                Image(
-                    bitmap = bitmap.asImageBitmap(),
-                    contentDescription = "Transfer QR",
+                QrImage(
+                    bitmap = bitmap,
                     modifier = Modifier
                         .padding(10.dp)
                         .size(214.dp),
                 )
+            }
+            Text(
+                "Tap to enlarge",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.align(Alignment.CenterHorizontally),
+            )
+            if (enlarged) {
+                QrFullscreenDialog(bitmap = bitmap, onDismiss = { enlarged = false })
             }
         } else {
             Text("QR unavailable", color = MaterialTheme.colorScheme.error)
@@ -1009,6 +1029,54 @@ private fun ConnectInviteCard(ticket: String?, qrPayload: String?) {
             }
         }
     }
+}
+
+/** Shows the QR as large as the screen allows, at full brightness, so another phone can scan it. */
+@Composable
+private fun QrFullscreenDialog(bitmap: Bitmap, onDismiss: () -> Unit) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        // Brightness is scoped to the dialog window, so it reverts when the dialog closes.
+        val window = (LocalView.current.parent as? DialogWindowProvider)?.window
+        SideEffect {
+            window?.let { it.attributes = it.attributes.apply { screenBrightness = 1f } }
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.92f))
+                .clickable(onClick = onDismiss),
+            contentAlignment = Alignment.Center,
+        ) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = Color.White,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+            ) {
+                QrImage(
+                    bitmap = bitmap,
+                    modifier = Modifier
+                        .padding(12.dp)
+                        .aspectRatio(1f),
+                )
+            }
+        }
+    }
+}
+
+/** The QR bitmap has one pixel per module; nearest-neighbor scaling keeps module edges sharp. */
+@Composable
+private fun QrImage(bitmap: Bitmap, modifier: Modifier = Modifier) {
+    Image(
+        bitmap = bitmap.asImageBitmap(),
+        contentDescription = "Transfer QR",
+        filterQuality = FilterQuality.None,
+        modifier = modifier,
+    )
 }
 
 @Composable
@@ -1271,8 +1339,12 @@ private fun tabForPage(page: Int): TransferTab = when (page) {
 
 private fun generateQrBitmap(content: String): Bitmap? {
     return runCatching {
-        val hints = mapOf(EncodeHintType.MARGIN to 1)
-        val matrix = QRCodeWriter().encode(content, BarcodeFormat.QR_CODE, 900, 900, hints)
+        // Level L keeps modules as large as possible; size 0 yields one pixel per module.
+        val hints = mapOf(
+            EncodeHintType.MARGIN to 1,
+            EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.L,
+        )
+        val matrix = QRCodeWriter().encode(content, BarcodeFormat.QR_CODE, 0, 0, hints)
         val width = matrix.width
         val height = matrix.height
         val pixels = IntArray(width * height)
