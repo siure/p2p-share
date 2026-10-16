@@ -771,15 +771,15 @@ body {
 }
 
 .qr-frame {
-  width: 150px;
-  height: 150px;
+  width: 220px;
+  height: 220px;
   border-radius: var(--radius-md);
   overflow: hidden;
   background: #fff;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 12px;
+  padding: 10px;
   box-shadow:
     0 0 40px var(--accent-dim),
     0 0 0 1px rgba(255, 255, 255, 0.08);
@@ -877,8 +877,8 @@ body {
 }
 
 .qr-overlay-content img {
-  width: 320px;
-  height: 320px;
+  width: min(80vh, 80vw, 720px);
+  height: min(80vh, 80vw, 720px);
   border-radius: 20px;
   background: #fff;
   padding: 24px;
